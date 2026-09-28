@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Pipes</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  body.idle { cursor: none; }
+  #fade { position: fixed; inset: 0; background: #000; opacity: 0; pointer-events: none; transition: opacity .6s; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="fade"></div>
+<script type="module">
+import * as THREE from 'three';
+import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
+
+// ---- options (?pipes=5&speed=35&teapots=0.004&joints=mixed) ----
+const q = new URLSearchParams(location.search);
+const NUM_PIPES   = +(q.get('pipes')   ?? 5);
+const SPEED       = +(q.get('speed')   ?? 35);    // segments per second per pipe
+const TEAPOT_ODDS = +(q.get('teapots') ?? 0.004); // chance a joint is a teapot
+const JOINTS      = q.get('joints') ?? 'mixed';  // mixed | ball | elbow
+const TURN_ODDS   = 0.22;
+const FILL_LIMIT  = 0.55;                         // reset when this fraction of the grid is used
+const MAX_TIME    = 90;                           // ...or after this many seconds
+
+const PIPE_R = 0.21, BALL_R = 0.31;
+const COLORS = [0xff2020, 0x20e020, 0x2050ff, 0xffe020, 0x20e0e0, 0xe020e0, 0xffffff, 0xff8a10]
+  .map(c => new THREE.Color(c));
+const DIRS = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]].map(d => new THREE.Vector3(...d));
+
+// ---- scene ----
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 200);
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const key = new THREE.DirectionalLight(0xffffff, 2.2);
+key.position.set(-4, 6, 10);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+fill.position.set(6, -3, 4);
+scene.add(fill);
+
+const mat = new THREE.MeshPhongMaterial({ color: 0xffffff, specular: 0x888888, shininess: 90 });
+
+function instanced(geo, max) {
+  const m = new THREE.InstancedMesh(geo, mat, max);
+  m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  m.setColorAt(0, COLORS[0]);   // allocate instanceColor
+  m.count = 0;
+  m.frustumCulled = false;
+  scene.add(m);
+  return m;
+}
+const segMesh  = instanced(new THREE.CylinderGeometry(PIPE_R, PIPE_R, 1, 20, 1, true), 12000);
+const ballMesh = instanced(new THREE.SphereGeometry(BALL_R, 24, 16), 4000);
+const elbowMesh = instanced(new THREE.SphereGeometry(PIPE_R, 20, 14), 6000);
+const potGeo = new TeapotGeometry(0.34, 8);
+const potMesh  = instanced(potGeo, 200);
+
+// ---- grid ----
+let GX, GY, GZ, occ, used;
+const idx = v => v.x + GX * (v.y + GY * v.z);
+const inGrid = v => v.x >= 0 && v.y >= 0 && v.z >= 0 && v.x < GX && v.y < GY && v.z < GZ;
+const free = v => inGrid(v) && !occ[idx(v)];
+const occupy = v => { occ[idx(v)] = 1; used++; };
+const world = v => new THREE.Vector3(v.x - (GX - 1) / 2, v.y - (GY - 1) / 2, v.z - (GZ - 1) / 2);
+
+// ---- instance helpers ----
+const tmpM = new THREE.Matrix4(), tmpQ = new THREE.Quaternion(), tmpS = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
+
+function addInstance(mesh, color) {
+  const i = mesh.count++;
+  mesh.setColorAt(i, color);
+  mesh.instanceColor.needsUpdate = true;
+  return i;
+}
+function setSegment(i, from, dir, len) {
+  tmpQ.setFromUnitVectors(UP, dir);
+  const mid = from.clone().addScaledVector(dir, len / 2);
+  tmpS.set(1, Math.max(len, 1e-4), 1);
+  segMesh.setMatrixAt(i, tmpM.compose(mid, tmpQ, tmpS));
+  segMesh.instanceMatrix.needsUpdate = true;
+}
+function addJoint(cell, color, elbow) {
+  const p = world(cell);
+  if (Math.random() < TEAPOT_ODDS && potMesh.count < potMesh.instanceMatrix.count) {
+    const i = addInstance(potMesh, color);
+    tmpQ.setFromEuler(new THREE.Euler(0, (Math.random() * 4 | 0) * Math.PI / 2, 0));
+    potMesh.setMatrixAt(i, tmpM.compose(p, tmpQ, tmpS.set(1, 1, 1)));
+    potMesh.instanceMatrix.needsUpdate = true;
+  } else {
+    const mesh = elbow ? elbowMesh : ballMesh;
+    if (mesh.count >= mesh.instanceMatrix.count) return;
+    const i = addInstance(mesh, color);
+    mesh.setMatrixAt(i, tmpM.makeTranslation(p));
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+// ---- pipes ----
+let pipes = [];
+
+function spawnPipe() {
+  for (let tries = 0; tries < 200; tries++) {
+    const c = new THREE.Vector3(Math.random() * GX | 0, Math.random() * GY | 0, Math.random() * GZ | 0);
+    if (!free(c)) continue;
+    const dirs = DIRS.filter(d => free(c.clone().add(d)));
+    if (!dirs.length) continue;
+    occupy(c);
+    const color = COLORS[Math.random() * COLORS.length | 0];
+    const elbow = JOINTS === 'elbow' || (JOINTS === 'mixed' && Math.random() < 0.5);
+    addJoint(c, color, elbow);                    // start cap
+    const pipe = { cell: c, dir: dirs[Math.random() * dirs.length | 0], color, elbow, seg: -1, t: 0, dead: false };
+    startSegment(pipe);
+    return pipe;
+  }
+  return null;
+}
+
+function startSegment(p) {
+  occupy(p.cell.clone().add(p.dir));
+  if (segMesh.count >= segMesh.instanceMatrix.count) { p.dead = true; return; }
+  p.seg = addInstance(segMesh, p.color);
+  p.t = 0;
+  setSegment(p.seg, world(p.cell), p.dir, 0);
+}
+
+// Called when a segment finishes: pick the next direction (or die).
+function advance(p) {
+  p.cell.add(p.dir);
+  const fwdFree = free(p.cell.clone().add(p.dir));
+  if (!fwdFree || Math.random() < TURN_ODDS) {
+    const turns = DIRS.filter(d => Math.abs(d.dot(p.dir)) < 0.5 && free(p.cell.clone().add(d)));
+    if (turns.length) {
+      p.dir = turns[Math.random() * turns.length | 0];
+      addJoint(p.cell, p.color, p.elbow);
+    } else if (!fwdFree) {
+      addJoint(p.cell, p.color, p.elbow);                  // end cap, then die
+      p.dead = true;
+      return;
+    }
+  }
+  startSegment(p);
+}
+
+// ---- lifecycle ----
+const fadeEl = document.getElementById('fade');
+let elapsed = 0, resetting = false;
+
+function sizeGrid() {
+  const aspect = innerWidth / innerHeight;
+  GY = 10; GZ = 10; GX = Math.max(8, Math.round(GY * aspect));
+}
+
+function placeCamera() {
+  const dist = Math.max(GY / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))),
+                        GX / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / camera.aspect);
+  const yaw = THREE.MathUtils.degToRad((Math.random() - 0.5) * 10);
+  const pitch = THREE.MathUtils.degToRad((Math.random() - 0.5) * 8);
+  const r = dist + GZ / 2 + 1;
+  camera.position.set(Math.sin(yaw) * r, Math.sin(pitch) * r, Math.cos(yaw) * Math.cos(pitch) * r);
+  camera.lookAt(0, 0, 0);
+}
+
+function reset() {
+  sizeGrid();
+  occ = new Uint8Array(GX * GY * GZ);
+  used = 0; elapsed = 0;
+  segMesh.count = ballMesh.count = elbowMesh.count = potMesh.count = 0;
+  placeCamera();
+  pipes = [];
+  for (let i = 0; i < NUM_PIPES; i++) { const p = spawnPipe(); if (p) pipes.push(p); }
+}
+
+function fadeReset() {
+  if (resetting) return;
+  resetting = true;
+  fadeEl.style.opacity = 1;
+  setTimeout(() => { reset(); fadeEl.style.opacity = 0; resetting = false; }, 650);
+}
+
+function tick(dt) {
+  if (resetting) return;
+  elapsed += dt;
+  for (let i = 0; i < pipes.length; i++) {
+    const p = pipes[i];
+    let step = dt * SPEED;
+    while (step > 0 && !p.dead) {
+      const d = Math.min(step, 1 - p.t);
+      p.t += d; step -= d;
+      setSegment(p.seg, world(p.cell), p.dir, p.t);
+      if (p.t >= 1) advance(p);
+    }
+    if (p.dead) pipes[i] = spawnPipe() ?? p;
+  }
+  pipes = pipes.filter(p => !p.dead);
+  if (used / occ.length > FILL_LIMIT || elapsed > MAX_TIME || !pipes.length) fadeReset();
+}
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', () => { resize(); fadeReset(); });
+
+// ---- input: click = fullscreen, space/r = new scene, cursor hides when idle ----
+addEventListener('click', () => document.fullscreenElement
+  ? document.exitFullscreen() : document.documentElement.requestFullscreen?.());
+addEventListener('keydown', e => { if (e.key === ' ' || e.key === 'r') fadeReset(); });
+let idleTimer;
+addEventListener('mousemove', () => {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 1500);
+});
+
+resize();
+reset();
+let last = performance.now();
+renderer.setAnimationLoop(now => {
+  tick(Math.min((now - last) / 1000, 0.1));
+  last = now;
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

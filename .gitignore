@@ -1,0 +1,6 @@
+# third-party clones built locally (swaylock-plugin, windowtolayer)
+build/
+# xscreensaver hacks tried out, not used by the lock screen
+hacks/
+# compiled from source here
+flightsim/flightsim
