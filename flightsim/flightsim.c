@@ -1,12 +1,18 @@
 /*
- * flightsim — an early-90s style flight-sim screensaver.
+ * flightsim — a flight-sim screensaver.
  *
- * Endless procedural flat-shaded terrain with forests, low-poly cumulus that
- * shade the ground, distance haze, a gradient sky, and an autopilot that banks through valleys and hops ridges, with an optional
- * green vector HUD. Plain Xlib + GLX + fixed-function GL, like the
- * xscreensaver hacks, so it runs the same way: --window, or --root (a
- * full-size child of the root window, which is what the swaylock-plugin /
- * Xwayland chain needs).
+ * Endless procedural mountains streamed into a geometry clipmap (~14 km of
+ * view), lit per pixel with baked terrain shadows and ambient occlusion,
+ * height fog that pools in the valleys, raymarched cumulus that shade the
+ * ground, reflective water, instanced forests, a painted sky with stars at
+ * night, HDR bloom and filmic tonemapping. An autopilot banks through valleys
+ * and hops ridges under the cloud deck, with an optional green vector HUD.
+ *
+ * Plain Xlib + GLX (GL 4.5 compatibility context), like the xscreensaver
+ * hacks, so it runs the same way: --window, or --root (a full-size child of
+ * the root window, which is what the swaylock-plugin / Xwayland chain needs).
+ * The scene renders at a dynamic resolution that tracks the frame budget, so
+ * several instances can share a small iGPU.
  *
  * Spanning: run one instance per monitor with the same --seed, --epoch and
  * --layout (every output's logical rect), and --output = this one's index.
@@ -17,40 +23,43 @@
  * Keys (window mode): q / Escape quit.
  */
 #define _DEFAULT_SOURCE
+#define GL_GLEXT_PROTOTYPES
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <GL/gl.h>
+#include <GL/glext.h>
 #include <GL/glx.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define DEG (180.0f / (float)M_PI)
 
 /* ---- options ---- */
 static int opt_root = 0, opt_hud = 1;
-static float opt_speed = 1.0f, opt_fov = 60.0f;
+static float opt_speed = 1.0f, opt_fov = 60.0f, opt_scale = 0;   /* 0 = dynamic */
 static const char *opt_time = "random";
 static uint32_t opt_seed = 0;
 static double opt_epoch = 0;          /* CLOCK_REALTIME seconds the sim starts at */
 static int opt_fov_set = 0;
 static int opt_trees = 1, opt_clouds = 1;
+static const char *opt_shot;          /* render one frame offscreen to this PPM */
+static int opt_bench;                 /* render this many frames offscreen, print timing */
+static int off_w = 1920, off_h = 1080;
+static double opt_at = 0;             /* start the sim this many seconds in */
 
 /* ---- spanning ---- */
 #define MAX_OUT 8
 static float span[MAX_OUT][4];       /* x, y, w, h of each output (logical) */
 static int span_n = 0, span_me = -1;
 
-/* ---- terrain ---- */
-#define CELL 24.0f
-#define HALF 170                 /* cells drawn each side of the camera */
-#define RING 512                 /* cache ring size (> 2*HALF+1) */
-#define FAR  (HALF * CELL)
-
+/* ---- noise ---- */
 static float seed_x, seed_z;
 
 static uint32_t hash2(int32_t x, int32_t z, uint32_t salt) {
@@ -93,194 +102,98 @@ static float smoothstep(float a, float b, float x) {
     return smooth(t < 0 ? 0 : t > 1 ? 1 : t);
 }
 
-/* Raw height; negative = under the sea. */
-static float terrain(float x, float z) {
+/* ---- terrain ---- */
+/* Raw height; negative = under the sea. Domain-warped hills, with ridged
+ * mountain ranges up to ~1.7 km where a low-frequency mask allows. */
+static float terrain(double x, double z) {
     x += seed_x; z += seed_z;
-    float base = fbm(x / 900, z / 900, 5, 11) * 260;
-    float mask = smoothstep(0.50f, 0.78f, fbm(x / 3200, z / 3200, 3, 23));
-    float mtn = powf(ridged(x / 750, z / 750, 5, 37), 1.4f) * 950 * mask;
-    return base + mtn - 95;
+    float wx = fbm((float)(x / 2400), (float)(z / 2400), 3, 71) - 0.5f;
+    float wz = fbm((float)(x / 2400) + 5.2f, (float)(z / 2400) + 1.3f, 3, 72) - 0.5f;
+    double X = x + wx * 1400, Z = z + wz * 1400;
+    float base = fbm((float)(X / 1100), (float)(Z / 1100), 5, 11) * 300;
+    float mask = smoothstep(0.40f, 0.66f, fbm((float)(x / 4200), (float)(z / 4200), 3, 23));
+    float mtn = 0;
+    if (mask > 0) mtn = powf(ridged((float)(X / 950), (float)(Z / 950), 6, 37), 1.35f) * 1900 * mask;
+    return base + mtn - 110;
 }
 
-#define MAXT 3                   /* trees per cell */
-typedef struct {
-    int32_t gx, gz;
-    float v[6][6];               /* C3F_V3F x 6 */
-    float lit;                   /* direct sunlight left after cloud shadow */
-    int nt;
-    float tr[MAXT][7];           /* x, y, z, height, radius, conifer, shade */
-} Cell;
-static Cell *cache;
-static float *verts;
-
-typedef struct {
-    float sky_zen[3], sky_hor[3], sun[3], sun_dir[3], light[3], ambient;
-} Palette;
-static Palette pal;
-
-static void land_color(float h, float slope, float out[3]) {
-    static const float sand[3] = {.76f, .70f, .48f}, grass[3] = {.33f, .58f, .22f},
-        lush[3] = {.22f, .45f, .17f}, forest[3] = {.16f, .34f, .14f},
-        rock[3] = {.46f, .41f, .35f}, snow[3] = {.95f, .95f, .98f};
-    const float *c;
-    if (h < 7) c = sand;
-    else if (slope > 0.5f && h > 60) c = rock;
-    else if (h < 110) c = grass;
-    else if (h < 230) c = lush;
-    else if (h < 430) c = forest;
-    else if (h < 720 || slope > 0.42f) c = rock;
-    else c = snow;
-    memcpy(out, c, sizeof(float) * 3);
+/* How wooded the ground is (0..1), before slope is considered. */
+static float forest(double x, double z, float h) {
+    if (h < 5 || h > 1250) return 0;
+    float alt = smoothstep(5, 30, h) * (1 - smoothstep(950, 1250, h));
+    float m = smoothstep(0.42f, 0.60f, fbm((float)((x + seed_x) / 650), (float)((z + seed_z) / 650), 4, 55));
+    float low = 0.55f + 0.45f * smoothstep(60, 220, h);    /* meadows down low */
+    return alt * m * low;
 }
 
-/* ---- clouds ---- */
-/* A sparse grid of cumulus: each CG cell may hold one cloud, a clump of
- * flat-bottomed puffs. Pure function of the cell, so shadows and drawing
- * (and every spanning instance) agree without storing anything. */
-#define CG 520.0f
-#define CLOUD_BASE 780.0f
-#define CLOUD_SPREAD 120.0f
-#define PUFFS 6
-typedef struct { float x, z, base; int n; float p[PUFFS][4]; /* dx, dz, r, height scale */ } Cloud;
-static int32_t cloud_off_x, cloud_off_z;
+#define BASE 8.0                     /* metres per finest lattice cell */
 
-static int get_cloud(int32_t i, int32_t j, Cloud *c) {
-    int32_t ii = i + cloud_off_x, jj = j + cloud_off_z;
-    float cover = 0.12f + 0.6f * fbm(ii * 0.21f, jj * 0.21f, 2, 211);
-    if (rand01(ii, jj, 202) >= cover) return 0;
-    c->x = (i + 0.2f + 0.6f * rand01(ii, jj, 203)) * CG;
-    c->z = (j + 0.2f + 0.6f * rand01(ii, jj, 204)) * CG;
-    c->base = CLOUD_BASE + CLOUD_SPREAD * rand01(ii, jj, 205);
-    float r0 = 80 + 110 * rand01(ii, jj, 206);
-    c->n = 3 + (int)(4 * rand01(ii, jj, 207));
-    if (c->n > PUFFS) c->n = PUFFS;
-    c->p[0][0] = c->p[0][1] = 0; c->p[0][2] = r0; c->p[0][3] = 0.7f + 0.2f * rand01(ii, jj, 212);
-    for (int k = 1; k < c->n; k++) {
-        float a = 2 * (float)M_PI * rand01(ii * 8 + k, jj, 208), d = r0 * (0.45f + 0.5f * rand01(ii * 8 + k, jj, 209));
-        c->p[k][0] = cosf(a) * d; c->p[k][1] = sinf(a) * d;
-        c->p[k][2] = r0 * (0.4f + 0.35f * rand01(ii * 8 + k, jj, 210));
-        c->p[k][3] = 0.55f + 0.3f * rand01(ii * 8 + k, jj, 213);
-    }
-    return 1;
-}
-
-/* Fraction of direct sun reaching (x, y, z) past the clouds. */
-static float sun_lit(float x, float y, float z) {
-    const float *sd = pal.sun_dir;
-    if (!opt_clouds || sd[1] < 0.02f) return 1;
-    float mid = CLOUD_BASE + CLOUD_SPREAD / 2 + 40, t = (mid - y) / sd[1];
-    if (t < 0) return 1;
-    float qx = x + sd[0] * t, qz = z + sd[2] * t, hz = sqrtf(sd[0] * sd[0] + sd[2] * sd[2]);
-    /* search wide enough for the base-height spread and the largest cloud */
-    int n = (int)ceilf(((CLOUD_SPREAD / 2 + 40) / sd[1] * hz + 670) / CG);
-    int32_t ci = (int32_t)floorf(qx / CG), cj = (int32_t)floorf(qz / CG);
-    float cover = 0;
-    for (int dj = -n; dj <= n; dj++)
-        for (int di = -n; di <= n; di++) {
-            Cloud c;
-            if (!get_cloud(ci + di, cj + dj, &c)) continue;
-            float tt = (c.base + 40 - y) / sd[1], px = x + sd[0] * tt, pz = z + sd[2] * tt;
-            for (int k = 0; k < c.n; k++) {
-                float dx = px - c.x - c.p[k][0], dz = pz - c.z - c.p[k][1];
-                float d = sqrtf(dx * dx + dz * dz) / c.p[k][2];
-                cover = fmaxf(cover, 1 - smoothstep(0.65f, 1.0f, d));
-            }
-        }
-    return 1 - 0.8f * cover;
-}
-
-static void build_tri(float *dst, const float p[3][3], const float raw[3], int32_t gx, int32_t gz, int tri, float lit) {
-    float ux = p[1][0] - p[0][0], uy = p[1][1] - p[0][1], uz = p[1][2] - p[0][2];
-    float vx = p[2][0] - p[0][0], vy = p[2][1] - p[0][1], vz = p[2][2] - p[0][2];
-    float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
-    float nl = sqrtf(nx * nx + ny * ny + nz * nz);
-    nx /= nl; ny /= nl; nz /= nl;
-
-    float col[3];
-    float jitter = 0.94f + 0.12f * rand01(gx * 2 + tri, gz, 99);
-    int water = raw[0] < 0 && raw[1] < 0 && raw[2] < 0;
-    if (water) {
-        float deep = smoothstep(0, 120, -(raw[0] + raw[1] + raw[2]) / 3);
-        col[0] = .20f - .08f * deep; col[1] = .42f - .14f * deep; col[2] = .66f - .10f * deep;
-        jitter = 0.97f + 0.06f * rand01(gx * 2 + tri, gz, 98);
-    } else {
-        land_color((p[0][1] + p[1][1] + p[2][1]) / 3, 1 - ny, col);
-    }
-    float lam = nx * pal.sun_dir[0] + ny * pal.sun_dir[1] + nz * pal.sun_dir[2];
-    if (lam < 0) lam = 0;
-    lam *= lit;
-    for (int k = 0; k < 3; k++) {
-        float c = col[k] * (pal.ambient + lam * pal.light[k]) * jitter;
-        col[k] = c > 1 ? 1 : c;
-    }
-    for (int i = 0; i < 3; i++) {
-        float *o = dst + i * 6;
-        o[0] = col[0]; o[1] = col[1]; o[2] = col[2];
-        o[3] = p[i][0]; o[4] = p[i][1]; o[5] = p[i][2];
-    }
-}
-
-static float ground(float x, float z);
-
-static Cell *get_cell(int32_t gx, int32_t gz) {
-    Cell *c = &cache[((gz & (RING - 1)) * RING) + (gx & (RING - 1))];
-    if (c->gx == gx && c->gz == gz) return c;
-    c->gx = gx; c->gz = gz;
-    float x0 = gx * CELL, z0 = gz * CELL, x1 = x0 + CELL, z1 = z0 + CELL;
-    float r00 = terrain(x0, z0), r10 = terrain(x1, z0), r01 = terrain(x0, z1), r11 = terrain(x1, z1);
-    float h00 = fmaxf(r00, 0), h10 = fmaxf(r10, 0), h01 = fmaxf(r01, 0), h11 = fmaxf(r11, 0);
-    float h = (h00 + h10 + h01 + h11) / 4, lit = c->lit = sun_lit(x0 + CELL / 2, h, z0 + CELL / 2);
-    if ((gx + gz) & 1) {
-        float a[3][3] = {{x0, h00, z0}, {x0, h01, z1}, {x1, h10, z0}}, ra[3] = {r00, r01, r10};
-        float b[3][3] = {{x1, h10, z0}, {x0, h01, z1}, {x1, h11, z1}}, rb[3] = {r10, r01, r11};
-        build_tri(&c->v[0][0], a, ra, gx, gz, 0, lit);
-        build_tri(&c->v[3][0], b, rb, gx, gz, 1, lit);
-    } else {
-        float a[3][3] = {{x0, h00, z0}, {x1, h11, z1}, {x1, h10, z0}}, ra[3] = {r00, r11, r10};
-        float b[3][3] = {{x0, h00, z0}, {x0, h01, z1}, {x1, h11, z1}}, rb[3] = {r00, r01, r11};
-        build_tri(&c->v[0][0], a, ra, gx, gz, 0, lit);
-        build_tri(&c->v[3][0], b, rb, gx, gz, 1, lit);
-    }
-
-    /* trees: none on beaches, steep slopes or above the treeline; clumped into
-     * forests by a low-frequency mask; pines take over with height */
-    c->nt = 0;
-    float gxs = ((r10 - r00) + (r11 - r01)) / (2 * CELL), gzs = ((r01 - r00) + (r11 - r10)) / (2 * CELL);
-    float slope = 1 - 1 / sqrtf(1 + gxs * gxs + gzs * gzs);
-    if (opt_trees && fminf(fminf(r00, r10), fminf(r01, r11)) > 8 && slope < 0.35f) {
-        float dens = h < 110 ? 0.3f : h < 230 ? 1.1f : h < 430 ? 2.2f : h < 600 ? 0.6f : 0;
-        dens *= 1.7f * smoothstep(0.35f, 0.65f, fbm((x0 + seed_x) / 420, (z0 + seed_z) / 420, 3, 55));
-        int n = (int)(dens + rand01(gx, gz, 60));
-        if (n > MAXT) n = MAXT;
-        for (int t = 0; t < n; t++) {
-            float *p = c->tr[c->nt++];
-            p[0] = x0 + CELL * (0.1f + 0.8f * rand01(gx * 4 + t, gz, 61));
-            p[2] = z0 + CELL * (0.1f + 0.8f * rand01(gx * 4 + t, gz, 62));
-            p[1] = ground(p[0], p[2]) - 1;
-            float pine_odds = h > 230 ? 0.9f : h > 110 ? 0.4f : 0.1f;
-            p[5] = rand01(gx * 4 + t, gz, 64) < pine_odds;
-            p[3] = (p[5] ? 16 : 12) + 14 * rand01(gx * 4 + t, gz, 63);
-            p[4] = (p[5] ? 0.3f : 0.42f) * p[3];
-            p[6] = 0.85f + 0.3f * rand01(gx * 4 + t, gz, 65);
-        }
-    }
-    return c;
-}
-
-/* Height of the drawn mesh (sea clamped to 0), for the autopilot. */
-static float ground(float x, float z) {
-    float fx = floorf(x / CELL), fz = floorf(z / CELL);
-    float tx = x / CELL - fx, tz = z / CELL - fz;
-    float x0 = fx * CELL, z0 = fz * CELL;
-    float a = fmaxf(terrain(x0, z0), 0), b = fmaxf(terrain(x0 + CELL, z0), 0);
-    float c = fmaxf(terrain(x0, z0 + CELL), 0), d = fmaxf(terrain(x0 + CELL, z0 + CELL), 0);
+/* Height of the ground (sea clamped to 0), bilinear over the finest lattice. */
+static float ground(double x, double z) {
+    double fx = floor(x / BASE), fz = floor(z / BASE);
+    float tx = (float)(x / BASE - fx), tz = (float)(z / BASE - fz);
+    double x0 = fx * BASE, z0 = fz * BASE;
+    float a = fmaxf(terrain(x0, z0), 0), b = fmaxf(terrain(x0 + BASE, z0), 0);
+    float c = fmaxf(terrain(x0, z0 + BASE), 0), d = fmaxf(terrain(x0 + BASE, z0 + BASE), 0);
     return (a + (b - a) * tx) * (1 - tz) + (c + (d - c) * tx) * tz;
+}
+
+/* ---- time of day ---- */
+typedef struct {
+    const char *name;
+    float el, az, sun[3], sun_i, zen[3], hor[3], hor_sun[3];
+    float fog_a, fog_b, haze;        /* height fog: density at sea level, falloff (1/m); uniform haze */
+    float cover, cbase, cthick, cdens;
+    float exposure, glow, stars, disc, amb, sat;
+} Preset;
+
+/* colours are sRGB; converted to linear when chosen */
+static const Preset presets[] = {
+    {"day",    50, 140, {1, .96f, .90f}, 4.2f, {.20f, .42f, .82f}, {.70f, .81f, .93f}, {.86f, .88f, .92f},
+     9e-5f, 1 / 1100.f, 1.1e-5f, .42f, 1500, 900, .06f, 1.0f, 1.0f, 0, .011f, 1.0f, 1.0f},
+    {"golden",  9,  95, {1, .76f, .50f}, 3.6f, {.30f, .44f, .72f}, {.90f, .80f, .72f}, {1, .78f, .52f},
+     2.4e-4f, 1 / 330.f, 1.4e-5f, .34f, 1550, 750, .05f, 1.05f, 1.4f, 0, .013f, 1.0f, 1.05f},
+    {"dusk",  3.2f, 250, {1, .50f, .24f}, 3.0f, {.11f, .14f, .34f}, {.82f, .48f, .40f}, {1, .58f, .30f},
+     1.3e-4f, 1 / 650.f, 1.3e-5f, .46f, 1550, 850, .05f, 1.2f, 1.7f, .12f, .015f, 1.0f, 1.05f},
+    {"night",  36, 205, {.62f, .72f, 1}, .30f, {.014f, .024f, .06f}, {.07f, .09f, .15f}, {.09f, .11f, .17f},
+     8e-5f, 1 / 1000.f, 9e-6f, .30f, 1550, 750, .05f, 2.6f, .5f, 1, .010f, 1.6f, 0.45f},
+};
+#define NPRESET (int)(sizeof presets / sizeof presets[0])
+
+static struct {
+    float sun_dir[3], sun[3], zen[3], hor[3], hor_sun[3], amb_sky[3], amb_gnd[3];
+    float fog_a, fog_b, haze, cover, cbase, cthick, cdens, exposure, glow, stars, disc, sat;
+} pal;
+
+static float lin(float c) { return powf(c, 2.2f); }
+
+static void choose_palette(void) {
+    int k = 0;
+    for (int i = 0; i < NPRESET; i++)
+        if (!strcmp(opt_time, presets[i].name)) k = i + 1;
+    k = k ? k - 1 : (int)(hash2((int32_t)opt_seed, 7, 99) % NPRESET);
+    const Preset *p = &presets[k];
+    float el = p->el / DEG, az = p->az / DEG;
+    pal.sun_dir[0] = cosf(el) * sinf(az);
+    pal.sun_dir[1] = sinf(el);
+    pal.sun_dir[2] = cosf(el) * cosf(az);
+    for (int i = 0; i < 3; i++) {
+        pal.sun[i] = lin(p->sun[i]) * p->sun_i;
+        pal.zen[i] = lin(p->zen[i]);
+        pal.hor[i] = lin(p->hor[i]);
+        pal.hor_sun[i] = lin(p->hor_sun[i]);
+        pal.amb_sky[i] = (pal.zen[i] * 0.6f + pal.hor[i] * 0.4f) * 1.1f * p->amb;
+        pal.amb_gnd[i] = (pal.hor[i] * 0.25f + pal.sun[i] * 0.03f * fmaxf(pal.sun_dir[1], 0)) * p->amb;
+    }
+    pal.fog_a = p->fog_a; pal.fog_b = p->fog_b; pal.haze = p->haze;
+    pal.cover = p->cover; pal.cbase = p->cbase; pal.cthick = p->cthick; pal.cdens = p->cdens;
+    pal.exposure = p->exposure; pal.glow = p->glow; pal.stars = p->stars; pal.disc = p->disc; pal.sat = p->sat;
 }
 
 /* ---- flight model (an autopilot, really) ---- */
 static struct {
-    float x, y, z, yaw, pitch, roll, vy;
+    double x, z;
+    float y, yaw, pitch, roll, vy;
     float speed, turn, turn_target, clearance, next_change;
 } fl;
 static uint32_t rng_state;
@@ -292,7 +205,7 @@ static float frand(void) {
 static void pick_route(float t) {
     fl.turn_target = (frand() * 2 - 1) * 0.22f;
     if (frand() < 0.3f) fl.turn_target *= 0.15f;           /* long straight legs */
-    fl.clearance = 60 + frand() * frand() * 260;           /* mostly low */
+    fl.clearance = 70 + frand() * frand() * 300;           /* mostly low */
     fl.next_change = t + 4 + frand() * 8;
 }
 
@@ -300,9 +213,9 @@ static void fly(float dt, float t) {
     if (t > fl.next_change) pick_route(t);
 
     /* steer toward lower ground: compare terrain ahead-left vs ahead-right */
-    float look = 450;
-    float lx = fl.x - sinf(fl.yaw + 0.6f) * look, lz = fl.z - cosf(fl.yaw + 0.6f) * look;
-    float rx = fl.x - sinf(fl.yaw - 0.6f) * look, rz = fl.z - cosf(fl.yaw - 0.6f) * look;
+    float look = 500;
+    double lx = fl.x - sinf(fl.yaw + 0.6f) * look, lz = fl.z - cosf(fl.yaw + 0.6f) * look;
+    double rx = fl.x - sinf(fl.yaw - 0.6f) * look, rz = fl.z - cosf(fl.yaw - 0.6f) * look;
     float bias = (ground(rx, rz) - ground(lx, lz)) * 0.0006f;
     if (bias > 0.3f) bias = 0.3f; else if (bias < -0.3f) bias = -0.3f;
     float want = fl.turn_target + bias;
@@ -313,15 +226,17 @@ static void fly(float dt, float t) {
     float roll_target = fl.turn * 1.5f;
     fl.roll += (roll_target - fl.roll) * (1 - expf(-dt * 2.0f));
 
-    /* terrain following: highest ground along the path ahead, discounted by distance */
-    float need = -1e9f;
+    /* terrain following: highest ground along the path ahead, discounted by
+     * distance; stay under the cloud deck unless the ground forces us up */
+    float need = -1e9f, safe = -1e9f;
     for (float d = 0; d <= 1600; d += 50) {
         float h = ground(fl.x - sinf(fl.yaw + fl.turn * d / fl.speed) * d,
                          fl.z - cosf(fl.yaw + fl.turn * d / fl.speed) * d);
-        float n = h + fl.clearance - d * 0.10f;
-        if (n > need) need = n;
+        need = fmaxf(need, h + fl.clearance - d * 0.10f);
+        safe = fmaxf(safe, h + 50 - d * 0.10f);
     }
-    float floor_h = ground(fl.x, fl.z) + 18;
+    need = fmaxf(fminf(need, pal.cbase - 120), safe);
+    float floor_h = ground(fl.x, fl.z) + 35;
     if (need < floor_h) need = floor_h;
     float vy_target = (need - fl.y) * 0.5f;
     if (vy_target > 55) vy_target = 55; else if (vy_target < -30) vy_target = -30;
@@ -331,8 +246,966 @@ static void fly(float dt, float t) {
     float pitch_target = atan2f(fl.vy, fl.speed);
     fl.pitch += (pitch_target - fl.pitch) * (1 - expf(-dt * 2.5f));
 
-    fl.x -= sinf(fl.yaw) * fl.speed * dt;
-    fl.z -= cosf(fl.yaw) * fl.speed * dt;
+    fl.x -= sin(fl.yaw) * fl.speed * dt;
+    fl.z -= cos(fl.yaw) * fl.speed * dt;
+}
+
+/* ---- threads ---- */
+static int nthreads = 1;
+typedef struct { void (*fn)(int, void *); void *arg; int n, next; pthread_mutex_t mu; } Job;
+static void *job_worker(void *p) {
+    Job *j = p;
+    for (;;) {
+        pthread_mutex_lock(&j->mu);
+        int i = j->next++;
+        pthread_mutex_unlock(&j->mu);
+        if (i >= j->n) return NULL;
+        j->fn(i, j->arg);
+    }
+}
+/* fn(i) for i in [0, n), across all cores */
+static void parallel_for(int n, void (*fn)(int, void *), void *arg) {
+    Job j = {fn, arg, n, 0, PTHREAD_MUTEX_INITIALIZER};
+    pthread_t th[64];
+    int k = nthreads < 64 ? nthreads : 64;
+    for (int i = 1; i < k; i++) pthread_create(&th[i], NULL, job_worker, &j);
+    job_worker(&j);
+    for (int i = 1; i < k; i++) pthread_join(th[i], NULL);
+}
+
+/* ---- streamed heightmaps ---- */
+/* Toroidal textures: texel (i & (n-1), j & (n-1)) holds lattice point (i, j),
+ * i.e. world (i, j) * unit * BASE, and GL_REPEAT does the wrapping for free.
+ * R = height, G = forest. Only rows/columns that scroll in get computed. */
+typedef struct {
+    int n, unit;
+    int32_t ox, oz;               /* lattice coords of the window's low corner */
+    int valid;
+    float *data;
+    GLuint tex;
+} HMap;
+static HMap hm[2] = {{512, 1, 0, 0, 0, NULL, 0}, {1024, 4, 0, 0, 0, NULL, 0}};
+
+static void hm_texel(HMap *m, int32_t i, int32_t j) {
+    double x = (double)i * m->unit * BASE, z = (double)j * m->unit * BASE;
+    float h = terrain(x, z);
+    float *d = m->data + 2 * ((size_t)(j & (m->n - 1)) * m->n + (i & (m->n - 1)));
+    d[0] = h; d[1] = forest(x, z, h);
+}
+static void hm_fill_row(int r, void *arg) {
+    HMap *m = arg;
+    for (int32_t i = m->ox; i < m->ox + m->n; i++) hm_texel(m, i, m->oz + r);
+}
+
+static void hm_update(HMap *m, double cx, double cz) {
+    double sp = m->unit * BASE;
+    int n = m->n, mask = n - 1;
+    int32_t nx = (int32_t)floor(cx / sp) - n / 2, nz = (int32_t)floor(cz / sp) - n / 2;
+    glBindTexture(GL_TEXTURE_2D, m->tex);
+    if (!m->valid || abs(nx - m->ox) >= n / 4 || abs(nz - m->oz) >= n / 4) {
+        m->ox = nx; m->oz = nz; m->valid = 1;
+        parallel_for(n, hm_fill_row, m);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, n, n, GL_RG, GL_FLOAT, m->data);
+        return;
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, n);
+    for (int32_t i = nx; i < nx + n; i++) {
+        if (i >= m->ox && i < m->ox + n) continue;
+        for (int32_t j = nz; j < nz + n; j++) hm_texel(m, i, j);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, i & mask);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, i & mask, 0, 1, n, GL_RG, GL_FLOAT, m->data);
+    }
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    for (int32_t j = nz; j < nz + n; j++) {
+        if (j >= m->oz && j < m->oz + n) continue;
+        for (int32_t i = nx; i < nx + n; i++) hm_texel(m, i, j);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, j & mask, n, 1, GL_RG, GL_FLOAT, m->data + 2 * (size_t)(j & mask) * n);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    m->ox = nx; m->oz = nz;
+}
+
+/* Bilinear height/forest from the fine map's CPU copy (must cover x, z). */
+static void hm0_sample(double x, double z, float *h, float *f) {
+    HMap *m = &hm[0];
+    double gx = x / BASE, gz = z / BASE, fx = floor(gx), fz = floor(gz);
+    int32_t i = (int32_t)fx, j = (int32_t)fz, mk = m->n - 1;
+    float tx = (float)(gx - fx), tz = (float)(gz - fz);
+    const float *a = m->data + 2 * ((size_t)(j & mk) * m->n + (i & mk));
+    const float *b = m->data + 2 * ((size_t)(j & mk) * m->n + ((i + 1) & mk));
+    const float *c = m->data + 2 * ((size_t)((j + 1) & mk) * m->n + (i & mk));
+    const float *d = m->data + 2 * ((size_t)((j + 1) & mk) * m->n + ((i + 1) & mk));
+    for (int k = 0; k < 2; k++) {
+        float v = (a[k] + (b[k] - a[k]) * tx) * (1 - tz) + (c[k] + (d[k] - c[k]) * tx) * tz;
+        if (k == 0) *h = v; else *f = v;
+    }
+}
+
+/* ---- GL helpers ---- */
+#define GLSL(...) #__VA_ARGS__
+
+static GLuint compile(GLenum type, const char *const *src, int n, const char *name) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, n, src, NULL);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[8192];
+        glGetShaderInfoLog(s, sizeof log, NULL, log);
+        fprintf(stderr, "flightsim: %s %s shader:\n%s\n", name, type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
+        exit(1);
+    }
+    return s;
+}
+
+static const char *GLSL_HEAD = "#version 330 core\n";
+static const char *GLSL_COMMON;
+
+static GLuint program(const char *name, const char *vs, const char *fs) {
+    const char *v[3] = {GLSL_HEAD, GLSL_COMMON, vs}, *f[3] = {GLSL_HEAD, GLSL_COMMON, fs};
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, v, 3, name));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, f, 3, name));
+    glLinkProgram(p);
+    GLint ok;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[8192];
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        fprintf(stderr, "flightsim: link %s:\n%s\n", name, log);
+        exit(1);
+    }
+    glUseProgram(p);
+    /* fixed texture units */
+    const char *units[] = {"uH0", "uH1", "uShadow", "uNoise2", "uNoise3", "uSrc", "uBloom"};
+    for (int i = 0; i < 7; i++) {
+        GLint l = glGetUniformLocation(p, units[i]);
+        if (l >= 0) glUniform1i(l, i);
+    }
+    return p;
+}
+
+#define UL(p, n) glGetUniformLocation(p, n)
+
+/* ---- shaders ---- */
+static const char *COMMON_SRC = GLSL(
+uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uZen; uniform vec3 uHor; uniform vec3 uHorSun;
+uniform vec3 uAmbSky; uniform vec3 uAmbGnd;
+uniform float uCamY; uniform float uTime;
+uniform float uFogA; uniform float uFogB; uniform float uHaze; uniform float uFogFar;
+uniform float uGlow; uniform float uStars; uniform float uDisc;
+uniform vec2 uWorldMod; uniform vec2 uCloudMod;
+uniform float uCloudBase; uniform float uCloudThick; uniform float uCloudCover; uniform float uCloudDens; uniform float uCloudsOn;
+uniform sampler2D uH0; uniform sampler2D uH1; uniform sampler2D uShadow;
+uniform sampler2D uNoise2; uniform sampler3D uNoise3;
+uniform vec2 uT0Cam; uniform vec2 uT1Cam;
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * .1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float hash13(vec3 p3) {
+    p3 = fract(p3 * .1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+/* the sky without the sun disc: also the colour of the haze */
+vec3 skyBase(vec3 rd) {
+    float y = max(rd.y, 0.0);
+    vec2 h = normalize(rd.xz + vec2(1e-5, 0.0)), s = normalize(uSunDir.xz + vec2(1e-5, 0.0));
+    float toward = dot(h, s) * 0.5 + 0.5;
+    vec3 hc = mix(uHor, uHorSun, pow(toward, 3.0) * (1.0 - smoothstep(0.0, 0.5, y)));
+    vec3 col = mix(hc, uZen, 1.0 - exp(-y * 3.2));
+    float mu = max(dot(rd, uSunDir), 0.0);
+    col += uSunCol * uGlow * (0.018 * pow(mu, 5.0) + 0.09 * pow(mu, 48.0) + 0.5 * pow(mu, 900.0));
+    return col;
+}
+vec3 sunDisc(vec3 rd) {
+    float mu = dot(rd, uSunDir);
+    return uSunCol * 40.0 * smoothstep(cos(uDisc), cos(uDisc * 0.8), mu);
+}
+vec3 stars(vec3 rd) {
+    if (uStars <= 0.0 || rd.y < 0.0) return vec3(0.0);
+    vec3 q = rd * 420.0, id = floor(q), f = fract(q) - 0.5;
+    float h = hash13(id);
+    if (h < 0.991) return vec3(0.0);
+    float b = (h - 0.991) / 0.009;
+    float tw = 0.75 + 0.25 * sin(uTime * (2.0 + 5.0 * hash13(id + 7.0)) + h * 60.0);
+    return mix(vec3(1.0, 0.8, 0.6), vec3(0.7, 0.8, 1.0), hash13(id + 3.0)) *
+           smoothstep(0.3, 0.0, length(f)) * b * b * 2.5 * tw * uStars * smoothstep(0.0, 0.2, rd.y);
+}
+
+/* transmittance of the height fog + haze over t metres along rd */
+float fogTrans(vec3 rd, float t) {
+    float k = rd.y * uFogB;
+    float od = uFogA * exp(-uFogB * uCamY) * (abs(k) > 1e-5 ? (1.0 - exp(-k * t)) / k : t) + uHaze * t;
+    return exp(-od) * (1.0 - smoothstep(uFogFar * 0.7, uFogFar, t));
+}
+vec3 fogColor(vec3 rd) { return skyBase(rd); }
+
+/* cumulus: a 2D coverage field sets each column's height, 3D billow noise erodes it */
+float cloudCov(vec2 xz) {
+    vec2 w = uCloudMod + xz;
+    float n = texture(uNoise2, w / 8192.0).r * 0.6 + texture(uNoise2, w / 2048.0).g * 0.4;
+    return smoothstep(1.0 - uCloudCover, 1.0 - uCloudCover + 0.28, n);
+}
+float cloudShadow(vec3 p) {
+    if (uCloudsOn < 0.5) return 1.0;
+    float y = uCloudBase + uCloudThick * 0.2;
+    vec2 q = p.xz + uSunDir.xz / max(uSunDir.y, 0.06) * (y - p.y);
+    return 1.0 - 0.78 * smoothstep(0.02, 0.3, cloudCov(q));
+}
+float hg(float mu, float g) { return (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5); }
+
+vec4 clouds(vec3 rd, float tmax, int steps, float jit) {
+    if (uCloudsOn < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
+    float top = uCloudBase + uCloudThick, t0, t1;
+    if (abs(rd.y) < 1e-4) {
+        if (uCamY < uCloudBase || uCamY > top) return vec4(0.0, 0.0, 0.0, 1.0);
+        t0 = 0.0; t1 = tmax;
+    } else {
+        float a = (uCloudBase - uCamY) / rd.y, b = (top - uCamY) / rd.y;
+        t0 = max(min(a, b), 0.0); t1 = min(max(a, b), tmax);
+    }
+    t1 = min(t1, uFogFar);
+    if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
+    float dt = (t1 - t0) / float(steps), T = 1.0;
+    vec3 L = vec3(0.0), fc = fogColor(rd);
+    float mu = dot(rd, uSunDir);
+    float phase = mix(hg(mu, -0.15), hg(mu, 0.7), 0.3);
+    for (int i = 0; i < steps; i++) {
+        float t = t0 + (float(i) + jit) * dt;
+        vec3 p = vec3(0.0, uCamY, 0.0) + rd * t;
+        float cov = cloudCov(p.xz);
+        if (cov <= 0.0) continue;
+        float h = (p.y - uCloudBase) / uCloudThick;
+        float d = min(cov * 1.1 - h * h * 1.3 - 0.05, h * 2.0);
+        if (d <= -0.3) continue;
+        vec3 q = vec3(uCloudMod.x + p.x, p.y * 1.6 - uTime * 1.5, uCloudMod.y + p.z) / 1024.0;
+        float bil = texture(uNoise3, q).r * 0.65 + texture(uNoise3, q * 3.7).r * 0.35;
+        d -= (1.0 - bil) * (0.30 + 0.25 * (1.0 - cov));
+        float dens = clamp(d * 3.0, 0.0, 1.0);
+        if (dens <= 0.0) continue;
+        /* light: optical depth up to the column top toward the sun, with a
+         * long tail standing in for multiple scattering */
+        float od = max(cov * 1.05 - h, 0.0) * uCloudThick * uCloudDens * 0.05 / max(uSunDir.y, 0.15);
+        float sunT = exp(-od) * 0.7 + exp(-od * 0.15) * 0.3;
+        float powder = 1.0 - exp(-dens * 3.0);
+        vec3 amb = uAmbSky * mix(0.55, 1.35, h) + uAmbGnd * (1.0 - h) * 0.3;
+        vec3 lum = uSunCol * sunT * phase * mix(0.6, 1.0, powder) * 0.9 + amb;
+        float a = 1.0 - exp(-dens * uCloudDens * dt);
+        float fT = fogTrans(rd, t);
+        L += T * a * (lum * fT + fc * (1.0 - fT));
+        T *= 1.0 - a;
+        if (T < 0.02) break;
+    }
+    return vec4(L, T);
+}
+
+/* baked terrain sun shadow (r) and ambient occlusion (g) */
+vec2 terrShadow(vec3 p) { return texture(uShadow, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0).rg; }
+
+/* fog, then any cloud in front of a surface t metres away */
+vec3 atmos(vec3 col, vec3 rd, float t, int steps, float jit) {
+    float T = fogTrans(rd, t);
+    col = col * T + fogColor(rd) * (1.0 - T);
+    if (uCloudsOn > 0.5 && (uCamY > uCloudBase || rd.y > 0.0)) {
+        vec4 c = clouds(rd, t, steps, jit);
+        col = col * c.a + c.rgb;
+    }
+    return col;
+}
+);
+
+static const char *VS_FULL = GLSL(
+out vec2 vUV;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    vUV = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+);
+
+static const char *FS_SKY = GLSL(
+in vec2 vUV;
+uniform vec4 uViewTan; uniform mat3 uCamRot;
+out vec4 oCol;
+void main() {
+    vec3 rd = normalize(uCamRot * vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0));
+    vec3 col = skyBase(rd) + sunDisc(rd) + stars(rd);
+    vec4 c = clouds(rd, 1e9, 56, hash12(gl_FragCoord.xy));
+    oCol = vec4(col * c.a + c.rgb, 1.0);
+}
+);
+
+static const char *VS_TERRAIN = GLSL(
+layout(location = 0) in ivec2 aV;
+layout(location = 1) in ivec2 aQ;
+uniform mat4 uVP;
+uniform ivec2 uOrg; uniform int uMul; uniform int uTexSel; uniform int uNQ; uniform ivec4 uHole; uniform float uMorph;
+uniform ivec2 uCamCell; uniform vec2 uCamFrac;
+out vec3 vRel;
+float hAt(ivec2 b) {
+    if (uTexSel == 0) return texelFetch(uH0, b & 511, 0).r;
+    return texelFetch(uH1, (b >> 2) & 1023, 0).r;
+}
+void main() {
+    if (aQ.x >= uHole.x && aQ.x < uHole.z && aQ.y >= uHole.y && aQ.y < uHole.w) {
+        vRel = vec3(0.0);
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
+    }
+    ivec2 L = uOrg + aV, b = L * uMul;
+    float h = hAt(b);
+    /* morph toward the next level's lattice at the border, so the rings meet without cracks */
+    ivec2 c2 = abs(aV * 2 - uNQ);
+    float M = float(uNQ) / 8.0, d = float(max(c2.x, c2.y)) * 0.5;
+    float t = uMorph * clamp((d - (float(uNQ) * 0.5 - M)) / M, 0.0, 1.0);
+    if (t > 0.0) {
+        ivec2 o = L & 1;
+        float hc = h;
+        if (o.x == 1 && o.y == 1)
+            hc = 0.25 * (hAt((L + ivec2(-1, -1)) * uMul) + hAt((L + ivec2(1, -1)) * uMul) +
+                         hAt((L + ivec2(-1, 1)) * uMul) + hAt((L + ivec2(1, 1)) * uMul));
+        else if (o.x == 1) hc = 0.5 * (hAt((L - ivec2(1, 0)) * uMul) + hAt((L + ivec2(1, 0)) * uMul));
+        else if (o.y == 1) hc = 0.5 * (hAt((L - ivec2(0, 1)) * uMul) + hAt((L + ivec2(0, 1)) * uMul));
+        h = mix(h, hc, t);
+    }
+    vec2 xz = vec2(b - uCamCell) * 8.0 - uCamFrac;
+    vRel = vec3(xz.x, h, xz.y);
+    gl_Position = uVP * vec4(vRel, 1.0);
+}
+);
+
+static const char *FS_TERRAIN = GLSL(
+in vec3 vRel;
+out vec4 oCol;
+vec3 hmNormal(sampler2D tex, vec2 uv, float px, float e, out float forest) {
+    vec2 c = texture(tex, uv).rg;
+    forest = c.g;
+    float hl = texture(tex, uv - vec2(px, 0.0)).r, hr = texture(tex, uv + vec2(px, 0.0)).r;
+    float hd = texture(tex, uv - vec2(0.0, px)).r, hu = texture(tex, uv + vec2(0.0, px)).r;
+    return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
+}
+float nz(vec2 w, float s, int ch) { vec4 v = texture(uNoise2, w / s); return ch == 0 ? v.r : ch == 1 ? v.g : ch == 2 ? v.b : v.a; }
+void main() {
+    vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
+    float dist = length(p - cam);
+    vec3 rd = (p - cam) / dist;
+    float cheb = max(abs(p.x), abs(p.z));
+    float f1, f0, forest;
+    vec3 n = hmNormal(uH1, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0, 1.0 / 1024.0, 32.0, f1);
+    forest = f1;
+    float w0 = 1.0 - smoothstep(1400.0, 1850.0, cheb);
+    if (w0 > 0.0) {
+        vec3 n0 = hmNormal(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 512.0, 1.0 / 512.0, 8.0, f0);
+        n = normalize(mix(n, n0, w0));
+        forest = mix(f1, f0, w0);
+    }
+    vec2 w = uWorldMod + p.xz;
+    float n1 = nz(w, 1024.0, 0), n2 = nz(w, 256.0, 1), n3 = nz(w, 32.0, 2);
+
+    /* small-scale relief the heightmap can't carry */
+    float near = 1.0 - smoothstep(200.0, 3000.0, dist);
+    if (near > 0.0) {
+        float e = 3.0, s = 48.0;
+        float a = nz(w, s, 3), bx = nz(w + vec2(e, 0.0), s, 3), bz = nz(w + vec2(0.0, e), s, 3);
+        float rockiness = smoothstep(0.15, 0.4, 1.0 - n.y) + 0.35;
+        n = normalize(n - vec3(bx - a, 0.0, bz - a) * 1.6 * near * rockiness);
+    }
+    float slope = 1.0 - n.y;
+    float h = p.y, hN = h + (n2 - 0.5) * 60.0;
+
+    /* materials (linear albedo) */
+    vec3 grassA = vec3(0.07, 0.13, 0.035), grassB = vec3(0.15, 0.16, 0.07), alpine = vec3(0.13, 0.15, 0.07);
+    vec3 canopy = vec3(0.028, 0.065, 0.025), sand = vec3(0.42, 0.36, 0.24), wet = vec3(0.20, 0.17, 0.12);
+    vec3 rock = vec3(0.19, 0.165, 0.14), snow = vec3(0.86, 0.89, 0.94);
+    vec3 col = mix(grassA, grassB, smoothstep(0.35, 0.75, n1 * 0.7 + n3 * 0.3));
+    col = mix(col, alpine, smoothstep(700.0, 1000.0, hN));
+    col *= 0.85 + 0.3 * n3;
+    float fo = smoothstep(0.15, 0.55, forest) * (1.0 - smoothstep(0.35, 0.5, slope));
+    col = mix(col, canopy * (0.65 + 0.7 * nz(w, 14.0, 3)), fo);
+    col = mix(sand, col, smoothstep(0.5, 3.5, h - 2.0 * n3));
+    float strata = 0.9 + 0.1 * sin(h * 0.05 + n2 * 6.0) + 0.25 * (n3 - 0.5);
+    vec3 rc = rock * strata * mix(vec3(1.0), vec3(1.15, 0.95, 0.8), n1);
+    float rockAmt = smoothstep(0.26, 0.40, slope + (n2 - 0.5) * 0.18) + smoothstep(1250.0, 1500.0, hN) * 0.6;
+    col = mix(col, rc, clamp(rockAmt, 0.0, 1.0));
+    float snowline = 1080.0 + (n1 - 0.5) * 260.0;
+    float snowAmt = smoothstep(snowline - 40.0, snowline + 60.0, hN) * smoothstep(0.42, 0.22, slope + (n3 - 0.5) * 0.15);
+    col = mix(col, snow, snowAmt);
+    if (h < 0.5) col = mix(wet, sand * 0.6, smoothstep(0.0, -8.0, h));
+
+    /* lighting */
+    vec2 sa = terrShadow(p);
+    float sh = sa.r * cloudShadow(p);
+    float diff = max(dot(n, uSunDir), 0.0);
+    vec3 amb = mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * (0.35 + 0.65 * sa.g) * (1.0 - 0.3 * fo);
+    vec3 lit = col * (uSunCol * diff * sh + amb);
+    vec3 H = normalize(uSunDir - rd);
+    lit += uSunCol * snowAmt * sh * pow(max(dot(n, H), 0.0), 40.0) * 0.25;
+    oCol = vec4(atmos(lit, rd, dist, 10, hash12(gl_FragCoord.xy)), 1.0);
+}
+);
+
+static const char *VS_WATER = GLSL(
+layout(location = 0) in vec2 aP;
+uniform mat4 uVP; uniform float uExtent;
+out vec3 vRel;
+void main() {
+    vRel = vec3(aP.x * uExtent, 0.0, aP.y * uExtent);
+    gl_Position = uVP * vec4(vRel, 1.0);
+}
+);
+
+static const char *FS_WATER = GLSL(
+in vec3 vRel;
+out vec4 oCol;
+float wav(vec2 w, float s, vec2 v) { return texture(uNoise2, w / s + v * uTime / s).b; }
+void main() {
+    vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
+    float cheb = max(abs(p.x), abs(p.z));
+    float hb = texture(uH1, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0).r;
+    float w0 = 1.0 - smoothstep(1400.0, 1850.0, cheb);
+    if (w0 > 0.0) hb = mix(hb, texture(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 512.0).r, w0);
+    float depth = -hb;
+    if (depth <= 0.0) discard;
+    float dist = length(p - cam);
+    vec3 rd = (p - cam) / dist;
+    vec2 w = uWorldMod + p.xz;
+
+    /* waves: two scrolling octaves, flattened with distance */
+    float amp = 1.0 / (1.0 + dist / 700.0);
+    vec2 g = vec2(0.0);
+    float e = 0.6;
+    for (int i = 0; i < 2; i++) {
+        float s = i == 0 ? 40.0 : 11.0;
+        vec2 v = i == 0 ? vec2(1.3, 0.7) : vec2(-0.8, 1.1);
+        float a = wav(w, s, v);
+        g += vec2(wav(w + vec2(e, 0.0), s, v) - a, wav(w + vec2(0.0, e), s, v) - a) / e * (i == 0 ? 3.0 : 1.2);
+    }
+    vec3 n = normalize(vec3(-g.x * amp, 1.0, -g.y * amp));
+    vec3 R = reflect(rd, n);
+    R.y = abs(R.y);
+    float F = 0.02 + 0.98 * pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
+    vec3 refl = skyBase(R);
+    if (uCloudsOn > 0.5) {
+        vec2 q = p.xz + R.xz / max(R.y, 0.03) * (uCloudBase + uCloudThick * 0.3);
+        float c = smoothstep(0.05, 0.45, cloudCov(q)) * smoothstep(0.0, 0.08, R.y);
+        refl = mix(refl, uAmbSky * 1.4 + uSunCol * 0.25 * max(uSunDir.y, 0.1), c * 0.85);
+    }
+    float sh = terrShadow(p).r * cloudShadow(p);
+    vec3 H = normalize(uSunDir - rd);
+    float nh = max(dot(n, H), 0.0);
+    vec3 spec = uSunCol * sh * (pow(nh, 700.0) * 40.0 + pow(nh, 90.0) * 1.5) * F * 4.0;
+    vec3 body = mix(vec3(0.015, 0.09, 0.085), vec3(0.003, 0.018, 0.03), 1.0 - exp(-depth / 20.0));
+    body *= uAmbSky * 1.5 + uSunCol * max(uSunDir.y, 0.0) * 0.35 * sh;
+    float aBody = 1.0 - exp(-depth / 3.5);
+    float fn = texture(uNoise2, w / 9.0 + vec2(uTime * 0.02, 0.0)).a;
+    float foam = smoothstep(1.4, 0.2, depth + (fn - 0.5) * 1.6) * (0.55 + 0.45 * sin(uTime * 1.7 - depth * 5.0 + fn * 8.0));
+    foam *= 1.0 - smoothstep(600.0, 2500.0, dist);
+    vec3 col = F * refl + (1.0 - F) * body * aBody + spec;
+    float alpha = clamp(F + (1.0 - F) * aBody, 0.0, 1.0);
+    col = mix(col, (uSunCol * max(uSunDir.y, 0.0) * sh + uAmbSky) * 0.7, foam * 0.8);
+    alpha = mix(alpha, 1.0, foam * 0.8);
+    float T = fogTrans(rd, dist);
+    col = col * T + fogColor(rd) * (1.0 - T) * alpha;
+    oCol = vec4(col, alpha);
+}
+);
+
+static const char *VS_TREE = GLSL(
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNrm;
+layout(location = 2) in float aAO;
+layout(location = 3) in vec4 iA;   /* rel x, y, rel z, height */
+layout(location = 4) in vec4 iB;   /* width, tint, rotation, type */
+uniform mat4 uVP; uniform float uTreeR;
+out vec3 vRel; out vec3 vN; out float vAO; out float vFade; out float vTint; out float vShadow; out float vType;
+void main() {
+    float c = cos(iB.z), s = sin(iB.z);
+    vec3 lp = vec3(aPos.x * c - aPos.z * s, aPos.y, aPos.x * s + aPos.z * c);
+    vec3 ln = vec3(aNrm.x * c - aNrm.z * s, aNrm.y, aNrm.x * s + aNrm.z * c);
+    float sway = sin(uTime * 1.1 + iA.x * 0.05 + iA.z * 0.07) * 0.015 * aPos.y * aPos.y;
+    vRel = vec3(iA.x + (lp.x + sway) * iB.x, iA.y + lp.y * iA.w, iA.z + lp.z * iB.x);
+    vN = normalize(vec3(ln.x / iB.x, ln.y / iA.w, ln.z / iB.x));
+    vAO = aAO; vTint = iB.y; vType = iB.w;
+    vFade = 1.0 - smoothstep(uTreeR * 0.72, uTreeR, length(iA.xz));
+    vShadow = terrShadow(iA.xyz).r * cloudShadow(iA.xyz);
+    gl_Position = uVP * vec4(vRel, 1.0);
+}
+);
+
+static const char *FS_TREE = GLSL(
+in vec3 vRel; in vec3 vN; in float vAO; in float vFade; in float vTint; in float vShadow; in float vType;
+out vec4 oCol;
+void main() {
+    if (hash12(gl_FragCoord.xy) > vFade) discard;
+    vec3 n = normalize(vN), cam = vec3(0.0, uCamY, 0.0);
+    float dist = length(vRel - cam);
+    vec3 rd = (vRel - cam) / dist;
+    vec3 base;
+    if (vAO < 0.0) base = vec3(0.07, 0.045, 0.03);
+    else if (vType < 0.5) base = mix(vec3(0.016, 0.045, 0.022), vec3(0.03, 0.06, 0.025), vTint);
+    else base = mix(vec3(0.04, 0.10, 0.022), vec3(0.11, 0.12, 0.025), vTint * vTint);
+    float ao = abs(vAO);
+    float diff = max(dot(n, uSunDir) * 0.75 + 0.25, 0.0);
+    float back = pow(max(dot(rd, uSunDir), 0.0), 5.0) * 0.7;
+    vec3 light = uSunCol * (diff + back) * vShadow * mix(0.6, 1.0, ao) + mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * ao;
+    oCol = vec4(atmos(base * light, rd, dist, 6, hash12(gl_FragCoord.xy)), 1.0);
+}
+);
+
+/* Bake the sun shadow + AO for every texel of the coarse map (in stripes). */
+static const char *FS_BAKE = GLSL(
+uniform ivec2 uOrg1;
+out vec4 oCol;
+float hAt(vec2 q) { return max(texture(uH1, (mod(q, 1024.0) + 0.5) / 1024.0).r, 0.0); }
+void main() {
+    ivec2 tx = ivec2(gl_FragCoord.xy);
+    ivec2 wl = uOrg1 + ((tx - (uOrg1 & 1023)) & 1023);
+    vec2 w = vec2(wl), lo = vec2(uOrg1), hi = vec2(uOrg1 + 1023);
+    float h0 = max(texelFetch(uH1, tx, 0).r, 0.0) + 2.0;
+    float hl = length(uSunDir.xz);
+    vec2 dir = uSunDir.xz / max(hl, 1e-4);
+    float rise = uSunDir.y / max(hl, 1e-4);
+    float sh = 1.0, d = 0.6;
+    for (int i = 0; i < 52; i++) {
+        d += 0.5 + d * 0.07;
+        vec2 q = w + dir * d;
+        if (any(lessThan(q, lo)) || any(greaterThan(q, hi))) break;
+        float s = (h0 + rise * d * 32.0 - hAt(q)) / (d * 32.0);
+        sh = min(sh, clamp(0.5 + s * 14.0, 0.0, 1.0));
+        if (sh <= 0.0) break;
+    }
+    float occ = 0.0;
+    for (int k = 0; k < 10; k++) {
+        float a = float(k) * 0.6283;
+        vec2 dv = vec2(cos(a), sin(a));
+        float m = 0.0;
+        for (int r = 0; r < 3; r++) {
+            float rr = r == 0 ? 1.5 : r == 1 ? 4.0 : 10.0;
+            vec2 q = clamp(w + dv * rr, lo, hi);
+            m = max(m, (hAt(q) - h0) / (rr * 32.0));
+        }
+        occ += m / sqrt(1.0 + m * m);
+    }
+    float ao = clamp(1.0 - occ / 10.0 * 1.6, 0.0, 1.0);
+    oCol = vec4(sh, ao, 0.0, 1.0);
+}
+);
+
+static const char *FS_DOWN = GLSL(
+in vec2 vUV;
+uniform sampler2D uSrc; uniform vec2 uTexel; uniform float uPrefilter;
+out vec4 oCol;
+void main() {
+    vec2 o = uTexel;
+    vec3 c = texture(uSrc, vUV).rgb * 4.0 + texture(uSrc, vUV + vec2(-o.x, -o.y)).rgb + texture(uSrc, vUV + vec2(o.x, -o.y)).rgb +
+             texture(uSrc, vUV + vec2(-o.x, o.y)).rgb + texture(uSrc, vUV + vec2(o.x, o.y)).rgb;
+    c /= 8.0;
+    if (uPrefilter > 0.0) {
+        c = min(c, vec3(80.0));
+        float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        c *= max(l - uPrefilter, 0.0) / max(l, 1e-4);
+    }
+    oCol = vec4(c, 1.0);
+}
+);
+
+static const char *FS_UP = GLSL(
+in vec2 vUV;
+uniform sampler2D uSrc; uniform vec2 uTexel;
+out vec4 oCol;
+void main() {
+    vec2 o = uTexel;
+    vec3 c = texture(uSrc, vUV + vec2(-o.x * 2.0, 0.0)).rgb + texture(uSrc, vUV + vec2(o.x * 2.0, 0.0)).rgb +
+             texture(uSrc, vUV + vec2(0.0, -o.y * 2.0)).rgb + texture(uSrc, vUV + vec2(0.0, o.y * 2.0)).rgb +
+             (texture(uSrc, vUV + vec2(-o.x, -o.y)).rgb + texture(uSrc, vUV + vec2(o.x, -o.y)).rgb +
+              texture(uSrc, vUV + vec2(-o.x, o.y)).rgb + texture(uSrc, vUV + vec2(o.x, o.y)).rgb) * 2.0;
+    oCol = vec4(c / 12.0, 1.0);
+}
+);
+
+static const char *FS_POST = GLSL(
+in vec2 vUV;
+uniform sampler2D uSrc; uniform sampler2D uBloom;
+uniform vec2 uTexel; uniform float uExposure; uniform float uBloomAmt; uniform float uSharpen; uniform float uSat;
+uniform vec4 uVig;   /* this view in layout-normalised coords: x0, y0, w, h */
+out vec4 oCol;
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+void main() {
+    vec3 c = texture(uSrc, vUV).rgb;
+    if (uSharpen > 0.0) {
+        vec3 nb = texture(uSrc, vUV + vec2(uTexel.x, 0.0)).rgb + texture(uSrc, vUV - vec2(uTexel.x, 0.0)).rgb +
+                  texture(uSrc, vUV + vec2(0.0, uTexel.y)).rgb + texture(uSrc, vUV - vec2(0.0, uTexel.y)).rgb;
+        c = max(c + (c * 4.0 - nb) * 0.25 * uSharpen, vec3(0.0));
+    }
+    c += texture(uBloom, vUV).rgb * uBloomAmt;
+    c = aces(c * uExposure);
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = max(mix(vec3(l), c, uSat), 0.0);
+    vec2 q = uVig.xy + vUV * uVig.zw - 0.5;
+    c *= 1.0 - 0.28 * smoothstep(0.25, 0.75, length(q * vec2(1.0, 0.8)));
+    c = pow(c, vec3(1.0 / 2.2));
+    c += (hash12(gl_FragCoord.xy) - 0.5) / 255.0;
+    oCol = vec4(c, 1.0);
+}
+);
+
+/* ---- GL state ---- */
+static GLuint p_sky, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
+static GLuint vao_empty, vao_terr, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3;
+static int terr_nverts;
+#define NQ 112                        /* quads per clipmap level side */
+#define LEVELS 6
+#define FOG_FAR 14000.0f
+
+/* offscreen targets */
+static GLuint fbo_scene, tex_scene, rb_depth, fbo_final, tex_final;
+static int scene_w, scene_h;
+#define NBLOOM 5
+static GLuint fbo_bloom[NBLOOM], tex_bloom[NBLOOM];
+static int bloom_w[NBLOOM], bloom_h[NBLOOM];
+
+static GLuint mk_tex2d(GLenum ifmt, int w, int h, GLenum fmt, GLenum type, const void *data, GLenum filt, GLenum wrap) {
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt == GL_LINEAR_MIPMAP_LINEAR ? GL_LINEAR : filt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+    return t;
+}
+static GLuint mk_fbo(GLuint tex) {
+    GLuint f;
+    glGenFramebuffers(1, &f);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    return f;
+}
+
+static void resize_scene(int w, int h) {
+    if (w == scene_w && h == scene_h) return;
+    scene_w = w; scene_h = h;
+    if (tex_scene) {
+        glDeleteTextures(1, &tex_scene); glDeleteRenderbuffers(1, &rb_depth); glDeleteFramebuffers(1, &fbo_scene);
+        glDeleteTextures(NBLOOM, tex_bloom); glDeleteFramebuffers(NBLOOM, fbo_bloom);
+    }
+    tex_scene = mk_tex2d(GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+    glGenRenderbuffers(1, &rb_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, w, h);
+    fbo_scene = mk_fbo(tex_scene);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb_depth);
+    for (int i = 0; i < NBLOOM; i++) {
+        bloom_w[i] = w >> (i + 1); bloom_h[i] = h >> (i + 1);
+        if (bloom_w[i] < 1) bloom_w[i] = 1;
+        if (bloom_h[i] < 1) bloom_h[i] = 1;
+        tex_bloom[i] = mk_tex2d(GL_R11F_G11F_B10F, bloom_w[i], bloom_h[i], GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+        fbo_bloom[i] = mk_fbo(tex_bloom[i]);
+    }
+}
+
+/* tileable value-noise fbm, lattice period p at the base octave */
+static float tile_vnoise(float x, float y, int p, uint32_t salt) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float tx = smooth(x - fx), ty = smooth(y - fy);
+    int x0 = ((ix % p) + p) % p, x1 = (x0 + 1) % p, y0 = ((iy % p) + p) % p, y1 = (y0 + 1) % p;
+    float a = rand01(x0, y0, salt), b = rand01(x1, y0, salt), c = rand01(x0, y1, salt), d = rand01(x1, y1, salt);
+    return (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
+}
+static int cmp_float_idx(const void *a, const void *b) {
+    float x = ((const float *)a)[0], y = ((const float *)b)[0];
+    return x < y ? -1 : x > y;
+}
+/* remap values to a uniform distribution, so thresholds mean area fractions */
+static void equalize(float *v, int n, int stride, unsigned char *out, int ostride) {
+    float *pairs = malloc(sizeof(float) * 2 * n);
+    for (int i = 0; i < n; i++) { pairs[2 * i] = v[i * stride]; memcpy(&pairs[2 * i + 1], &i, sizeof(int)); }
+    qsort(pairs, n, sizeof(float) * 2, cmp_float_idx);
+    for (int r = 0; r < n; r++) {
+        int i;
+        memcpy(&i, &pairs[2 * r + 1], sizeof(int));
+        out[i * ostride] = (unsigned char)(r * 255.0f / (n - 1) + 0.5f);
+    }
+    free(pairs);
+}
+
+static void make_noise(void) {
+    enum { N2 = 256 };
+    float *v = malloc(sizeof(float) * N2 * N2);
+    unsigned char *px = malloc(N2 * N2 * 4);
+    const int period[4] = {4, 8, 16, 8}, oct[4] = {6, 5, 5, 3};
+    for (int ch = 0; ch < 4; ch++) {
+        for (int y = 0; y < N2; y++)
+            for (int x = 0; x < N2; x++) {
+                float s = 0, amp = 0.5f, norm = 0;
+                int p = period[ch];
+                for (int o = 0; o < oct[ch] && p <= N2; o++, p *= 2, amp *= 0.5f) {
+                    s += tile_vnoise((float)x / N2 * p, (float)y / N2 * p, p, 500 + ch * 16 + o) * amp;
+                    norm += amp;
+                }
+                v[y * N2 + x] = s / norm;
+            }
+        equalize(v, N2 * N2, 1, px + ch, 4);
+    }
+    tex_noise2 = mk_tex2d(GL_RGBA8, N2, N2, GL_RGBA, GL_UNSIGNED_BYTE, px, GL_LINEAR_MIPMAP_LINEAR, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    free(v); free(px);
+
+    /* 3D billows: inverted tileable Worley at three frequencies */
+    enum { N3 = 64 };
+    float *w = malloc(sizeof(float) * N3 * N3 * N3);
+    unsigned char *vox = malloc(N3 * N3 * N3);
+    const int cells[3] = {4, 8, 16};
+    const float wt[3] = {0.6f, 0.28f, 0.12f};
+    for (int z = 0; z < N3; z++)
+        for (int y = 0; y < N3; y++)
+            for (int x = 0; x < N3; x++) {
+                float s = 0;
+                for (int k = 0; k < 3; k++) {
+                    int c = cells[k];
+                    float px3 = (x + 0.5f) / N3 * c, py = (y + 0.5f) / N3 * c, pz = (z + 0.5f) / N3 * c;
+                    int ix = (int)px3, iy = (int)py, iz = (int)pz;
+                    float best = 9;
+                    for (int dz = -1; dz <= 1; dz++)
+                        for (int dy = -1; dy <= 1; dy++)
+                            for (int dx = -1; dx <= 1; dx++) {
+                                int cx = ix + dx, cy = iy + dy, cz = iz + dz;
+                                int wx = (cx + c) % c, wy = (cy + c) % c, wz = (cz + c) % c;
+                                uint32_t hh = hash2(wx + wz * 97, wy, 700 + k);
+                                float fx = cx + (hh & 1023) / 1024.0f, fy = cy + ((hh >> 10) & 1023) / 1024.0f,
+                                      fz = cz + rand01(wx + wz * 97, wy, 710 + k);
+                                float d = (fx - px3) * (fx - px3) + (fy - py) * (fy - py) + (fz - pz) * (fz - pz);
+                                if (d < best) best = d;
+                            }
+                    s += (1 - fminf(sqrtf(best), 1)) * wt[k];
+                }
+                w[(z * N3 + y) * N3 + x] = s;
+            }
+    equalize(w, N3 * N3 * N3, 1, vox, 1);
+    glGenTextures(1, &tex_noise3);
+    glBindTexture(GL_TEXTURE_3D, tex_noise3);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, N3, N3, N3, 0, GL_RED, GL_UNSIGNED_BYTE, vox);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_3D);
+    free(w); free(vox);
+}
+
+/* ---- trees ---- */
+/* Meshes are in unit space: y scaled by the tree's height, x/z by its width.
+ * Vertex: position, normal, ao (negative = bark). */
+typedef struct { float *v; int n, cap; } Mesh;
+static Mesh tmesh[4];                  /* pine near, pine far, broadleaf near, broadleaf far */
+static GLuint vao_tree[4], vbo_tree_inst;
+
+static void mesh_vert(Mesh *m, const float p[3], const float n[3], float ao) {
+    if (m->n == m->cap) { m->cap = m->cap ? m->cap * 2 : 256; m->v = realloc(m->v, sizeof(float) * 7 * m->cap); }
+    float *o = m->v + 7 * m->n++;
+    memcpy(o, p, 12); memcpy(o + 3, n, 12); o[6] = ao;
+}
+/* a triangle wound counter-clockwise when seen from `out` */
+static void mesh_tri(Mesh *m, const float *a, const float *b, const float *c,
+                     const float *na, const float *nb, const float *nc, float aa, float ab, float ac, const float out[3]) {
+    float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    float fn[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+    if (fn[0] * out[0] + fn[1] * out[1] + fn[2] * out[2] < 0) {
+        const float *t = b; b = c; c = t; t = nb; nb = nc; nc = t;
+        float s = ab; ab = ac; ac = s;
+    }
+    mesh_vert(m, a, na, aa); mesh_vert(m, b, nb, ab); mesh_vert(m, c, nc, ac);
+}
+static void norm3(float v[3]) { float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (l > 0) { v[0] /= l; v[1] /= l; v[2] /= l; } }
+
+static void gen_trunk(Mesh *m, float r, float y1, int seg) {
+    for (int s = 0; s < seg; s++) {
+        float a0 = s * 2 * (float)M_PI / seg, a1 = (s + 1) * 2 * (float)M_PI / seg;
+        float p0[3] = {cosf(a0) * r, 0, sinf(a0) * r}, p1[3] = {cosf(a1) * r, 0, sinf(a1) * r};
+        float q0[3] = {p0[0] * 0.7f, y1, p0[2] * 0.7f}, q1[3] = {p1[0] * 0.7f, y1, p1[2] * 0.7f};
+        float n0[3] = {cosf(a0), 0, sinf(a0)}, n1[3] = {cosf(a1), 0, sinf(a1)};
+        float out[3] = {cosf((a0 + a1) / 2), 0, sinf((a0 + a1) / 2)};
+        mesh_tri(m, p0, p1, q0, n0, n1, n0, -0.5f, -0.5f, -0.9f, out);
+        mesh_tri(m, p1, q1, q0, n1, n1, n0, -0.5f, -0.9f, -0.9f, out);
+    }
+}
+
+static void gen_pine(Mesh *m, int layers, int seg, int detail) {
+    static const float yb[4] = {0.10f, 0.32f, 0.52f, 0.70f}, yt[4] = {0.56f, 0.73f, 0.87f, 1.0f}, rb[4] = {0.42f, 0.34f, 0.26f, 0.17f};
+    static const float yb2[2] = {0.12f, 0.50f}, yt2[2] = {0.72f, 1.0f}, rb2[2] = {0.40f, 0.26f};
+    if (detail) gen_trunk(m, 0.035f, 0.35f, 5);
+    for (int L = 0; L < layers; L++) {
+        float b = layers == 4 ? yb[L] : yb2[L], t = layers == 4 ? yt[L] : yt2[L], r = layers == 4 ? rb[L] : rb2[L];
+        float f = (float)L / (layers - 1);
+        float apex[3] = {0, t, 0}, up[3] = {0, 1, 0};
+        for (int s = 0; s < seg; s++) {
+            float a0 = (s + 0.5f * L) * 2 * (float)M_PI / seg, a1 = (s + 1 + 0.5f * L) * 2 * (float)M_PI / seg;
+            float r0 = r * (0.85f + 0.3f * rand01(s, L, 800)), r1 = r * (0.85f + 0.3f * rand01((s + 1) % seg, L, 800));
+            float p0[3] = {cosf(a0) * r0, b - 0.03f * rand01(s, L, 801), sinf(a0) * r0};
+            float p1[3] = {cosf(a1) * r1, b - 0.03f * rand01((s + 1) % seg, L, 801), sinf(a1) * r1};
+            float n0[3] = {cosf(a0) * (t - b), r * 1.2f, sinf(a0) * (t - b)}, n1[3] = {cosf(a1) * (t - b), r * 1.2f, sinf(a1) * (t - b)};
+            norm3(n0); norm3(n1);
+            float na[3] = {(n0[0] + n1[0]) * 0.3f, 1, (n0[2] + n1[2]) * 0.3f};
+            norm3(na);
+            float ao = 0.45f + 0.45f * f;
+            float out[3] = {n0[0] + n1[0], n0[1] + n1[1], n0[2] + n1[2]};
+            mesh_tri(m, p0, p1, apex, n0, n1, na, ao, ao, 1.0f, out);
+            if (detail) {
+                float c[3] = {0, b + 0.07f * (t - b), 0}, dn[3] = {0, -1, 0}, o2[3] = {0, -1, 0};
+                mesh_tri(m, p0, p1, c, dn, dn, dn, 0.2f, 0.2f, 0.15f, o2);
+            }
+        }
+        (void)up;
+    }
+}
+
+/* lumpy canopy blob: an icosahedron (subdivided once for the near LOD) */
+static void gen_blob(Mesh *m, const float ctr[3], const float rad[3], int subdiv, uint32_t salt) {
+    const float X = 0.525731f, Z = 0.850651f;
+    const float ico[12][3] = {{-X, 0, Z}, {X, 0, Z}, {-X, 0, -Z}, {X, 0, -Z}, {0, Z, X}, {0, Z, -X},
+                              {0, -Z, X}, {0, -Z, -X}, {Z, X, 0}, {-Z, X, 0}, {Z, -X, 0}, {-Z, -X, 0}};
+    const int f[20][3] = {{0, 4, 1}, {0, 9, 4}, {9, 5, 4}, {4, 5, 8}, {4, 8, 1}, {8, 10, 1}, {8, 3, 10}, {5, 3, 8},
+                          {5, 2, 3}, {2, 7, 3}, {7, 10, 3}, {7, 6, 10}, {7, 11, 6}, {11, 0, 6}, {0, 1, 6},
+                          {6, 1, 10}, {9, 0, 11}, {9, 11, 2}, {9, 2, 5}, {7, 2, 11}};
+    float tris[80][3][3];
+    int nt = 0;
+    for (int i = 0; i < 20; i++) {
+        const float *a = ico[f[i][0]], *b = ico[f[i][1]], *c = ico[f[i][2]];
+        if (!subdiv) { memcpy(tris[nt][0], a, 12); memcpy(tris[nt][1], b, 12); memcpy(tris[nt][2], c, 12); nt++; continue; }
+        float ab[3], bc[3], ca[3];
+        for (int k = 0; k < 3; k++) { ab[k] = a[k] + b[k]; bc[k] = b[k] + c[k]; ca[k] = c[k] + a[k]; }
+        norm3(ab); norm3(bc); norm3(ca);
+        const float *sub[4][3] = {{a, ab, ca}, {ab, b, bc}, {ca, bc, c}, {ab, bc, ca}};
+        for (int s = 0; s < 4; s++, nt++)
+            for (int v = 0; v < 3; v++) memcpy(tris[nt][v], sub[s][v], 12);
+    }
+    for (int i = 0; i < nt; i++) {
+        float p[3][3], n[3][3], ao[3], out[3] = {0, 0, 0};
+        for (int v = 0; v < 3; v++) {
+            const float *d = tris[i][v];
+            int32_t qx = (int32_t)lroundf(d[0] * 1000), qy = (int32_t)lroundf(d[1] * 1000), qz = (int32_t)lroundf(d[2] * 1000);
+            float lump = 0.82f + 0.32f * rand01(qx * 31 + qz, qy, salt);
+            for (int k = 0; k < 3; k++) { p[v][k] = ctr[k] + d[k] * rad[k] * lump; n[v][k] = d[k]; out[k] += d[k]; }
+            ao[v] = 0.35f + 0.65f * (d[1] * 0.5f + 0.5f);
+        }
+        /* half face normal, half sphere normal: lumps read but stay soft */
+        float u[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]}, w[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+        float fn[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+        norm3(fn);
+        if (fn[0] * out[0] + fn[1] * out[1] + fn[2] * out[2] < 0) for (int k = 0; k < 3; k++) fn[k] = -fn[k];
+        for (int v = 0; v < 3; v++) { for (int k = 0; k < 3; k++) n[v][k] = n[v][k] * 0.5f + fn[k] * 0.5f; norm3(n[v]); }
+        mesh_tri(m, p[0], p[1], p[2], n[0], n[1], n[2], ao[0], ao[1], ao[2], out);
+    }
+}
+
+static void gen_broadleaf(Mesh *m, int detail) {
+    if (detail) gen_trunk(m, 0.045f, 0.5f, 5);
+    float c0[3] = {0, 0.58f, 0}, r0[3] = {0.40f, 0.30f, 0.40f};
+    gen_blob(m, c0, r0, detail, 820);
+    if (detail) {
+        float c1[3] = {0.12f, 0.80f, -0.06f}, r1[3] = {0.26f, 0.20f, 0.26f};
+        float c2[3] = {-0.16f, 0.70f, 0.12f}, r2[3] = {0.25f, 0.2f, 0.25f};
+        gen_blob(m, c1, r1, 1, 821);
+        gen_blob(m, c2, r2, 1, 822);
+    }
+}
+
+/* Tree chunks: 128 m squares, generated once from the fine heightmap and kept
+ * in a ring; each frame the visible ones are gathered into one instance buffer. */
+#define TCH 128.0
+#define TRING 64
+#define TREE_R 1500.0f
+#define TREE_NEAR 420.0f
+typedef struct { int32_t cx, cz; int n, valid; float *inst; } TChunk;   /* inst: n * 8 */
+static TChunk tchunk[TRING * TRING];
+static float *tinst;
+static int tinst_cap;
+
+static void tchunk_gen(TChunk *c, int32_t cx, int32_t cz) {
+    c->cx = cx; c->cz = cz; c->n = 0; c->valid = 1;
+    enum { G = 24 };
+    float sp = (float)TCH / G;
+    float *buf = malloc(sizeof(float) * 8 * G * G);
+    for (int j = 0; j < G; j++)
+        for (int i = 0; i < G; i++) {
+            int32_t gi = cx * G + i, gj = cz * G + j;
+            double x = cx * TCH + (i + 0.1f + 0.8f * rand01(gi, gj, 61)) * sp;
+            double z = cz * TCH + (j + 0.1f + 0.8f * rand01(gi, gj, 62)) * sp;
+            float h, fo, hx, hz, dummy;
+            hm0_sample(x, z, &h, &fo);
+            if (h < 3 || fo < 0.05f) continue;
+            hm0_sample(x + 6, z, &hx, &dummy);
+            hm0_sample(x, z + 6, &hz, &dummy);
+            float slope = sqrtf((hx - h) * (hx - h) + (hz - h) * (hz - h)) / 6;
+            if (slope > 0.75f) continue;
+            if (rand01(gi, gj, 60) > fo * 0.9f * (1 - smoothstep(0.45f, 0.75f, slope))) continue;
+            float pine_odds = h > 450 ? 0.92f : h > 180 ? 0.55f : 0.2f;
+            int pine = rand01(gi, gj, 64) < pine_odds;
+            float ht = pine ? 14 + 14 * rand01(gi, gj, 63) : 10 + 9 * rand01(gi, gj, 63);
+            ht *= 0.75f + 0.25f * smoothstep(0.1f, 0.6f, fo);
+            float *p = buf + 8 * c->n++;
+            p[0] = (float)(x - cx * TCH); p[1] = h - 1.2f; p[2] = (float)(z - cz * TCH); p[3] = ht;
+            p[4] = ht * (0.8f + 0.35f * rand01(gi, gj, 65)); p[5] = rand01(gi, gj, 66);
+            p[6] = rand01(gi, gj, 67) * 6.2832f; p[7] = pine ? 0 : 1;
+        }
+    free(c->inst);
+    c->inst = realloc(buf, sizeof(float) * 8 * (c->n ? c->n : 1));
+}
+
+static int tree_count[4];
+
+/* gather visible trees into 4 LOD/type ranges; returns total */
+static void trees_update(void) {
+    int32_t ccx = (int32_t)floor(fl.x / TCH), ccz = (int32_t)floor(fl.z / TCH);
+    int R = (int)ceil(TREE_R / TCH) + 1, gens = 0;
+    float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw);
+    static float *lists[4];
+    static int caps[4];
+    int cnt[4] = {0, 0, 0, 0};
+    for (int dz = -R; dz <= R; dz++)
+        for (int dx = -R; dx <= R; dx++) {
+            int32_t cx = ccx + dx, cz = ccz + dz;
+            float ox = (float)(cx * TCH - fl.x), oz = (float)(cz * TCH - fl.z);
+            float mx = ox + (float)TCH / 2, mz = oz + (float)TCH / 2, md = sqrtf(mx * mx + mz * mz);
+            if (md > TREE_R + 92) continue;
+            if (mx * fx + mz * fz < -140 && md > 200) continue;
+            TChunk *c = &tchunk[(cz & (TRING - 1)) * TRING + (cx & (TRING - 1))];
+            if (!c->valid || c->cx != cx || c->cz != cz) {
+                if (gens >= 24 && md > 300) continue;
+                tchunk_gen(c, cx, cz);
+                gens++;
+            }
+            for (int t = 0; t < c->n; t++) {
+                const float *s = c->inst + 8 * t;
+                float x = ox + s[0], z = oz + s[2], d2 = x * x + z * z;
+                if (d2 > TREE_R * TREE_R) continue;
+                int k = (int)s[7] * 2 + (d2 > TREE_NEAR * TREE_NEAR);
+                if (cnt[k] == caps[k]) { caps[k] = caps[k] ? caps[k] * 2 : 4096; lists[k] = realloc(lists[k], sizeof(float) * 8 * caps[k]); }
+                float *o = lists[k] + 8 * cnt[k]++;
+                memcpy(o, s, sizeof(float) * 8);
+                o[0] = x; o[2] = z;
+            }
+        }
+    int total = cnt[0] + cnt[1] + cnt[2] + cnt[3];
+    if (total > tinst_cap) { tinst_cap = total * 2; tinst = realloc(tinst, sizeof(float) * 8 * tinst_cap); }
+    int off = 0;
+    for (int k = 0; k < 4; k++) {
+        memcpy(tinst + 8 * off, lists[k], sizeof(float) * 8 * cnt[k]);
+        tree_count[k] = cnt[k];
+        off += cnt[k];
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_tree_inst);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 8 * (total ? total : 1), NULL, GL_STREAM_DRAW);
+    if (total) glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * 8 * total, tinst);
 }
 
 /* ---- drawing ---- */
@@ -342,18 +1215,22 @@ static int W = 800, H = 600;
  * focal length in canvas units, and this window shows canvas rect view_*.
  * Canvas y grows downward. Without --layout the canvas is just the window. */
 static float cam_cx, cam_cy, cam_f, view_x, view_y, view_w, view_h, hud_h;
+static float lay_x0, lay_y0, lay_w, lay_h;
 
 static void setup_view(void) {
     if (span_me < 0) {
         view_x = view_y = 0; view_w = W; view_h = H;
         cam_cx = W / 2.0f; cam_cy = H / 2.0f; hud_h = H;
         cam_f = H / 2.0f / tanf(opt_fov / 2 / DEG);
+        lay_x0 = lay_y0 = 0; lay_w = W; lay_h = H;
         return;
     }
-    float x0 = 1e9f, x1 = -1e9f;
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
     for (int i = 0; i < span_n; i++) {
         x0 = fminf(x0, span[i][0]); x1 = fmaxf(x1, span[i][0] + span[i][2]);
+        y0 = fminf(y0, span[i][1]); y1 = fmaxf(y1, span[i][1] + span[i][3]);
     }
+    lay_x0 = x0; lay_y0 = y0; lay_w = x1 - x0; lay_h = y1 - y0;
     /* centre on the output under the middle of the layout (the "front" one) */
     float mx = (x0 + x1) / 2;
     int mid = 0;
@@ -369,206 +1246,204 @@ static void setup_view(void) {
     view_w = span[span_me][2]; view_h = span[span_me][3];
 }
 
-static void draw_sky(void) {
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_FOG);
-    glDepthMask(GL_FALSE);
-    glShadeModel(GL_SMOOTH);
-    const float R = FAR * 0.8f;
-    const int SEG = 36, RINGS = 10;
-    for (int r = -2; r < RINGS; r++) {
-        float e0 = r * (float)M_PI / 2 / RINGS, e1 = (r + 1) * (float)M_PI / 2 / RINGS;
-        glBegin(GL_QUAD_STRIP);
-        for (int s = 0; s <= SEG; s++) {
-            float a = s * 2 * (float)M_PI / SEG;
-            for (int k = 0; k < 2; k++) {
-                float e = k ? e1 : e0;
-                float t = e <= 0 ? 0 : powf(sinf(e), 0.55f);
-                glColor3f(pal.sky_hor[0] + (pal.sky_zen[0] - pal.sky_hor[0]) * t,
-                          pal.sky_hor[1] + (pal.sky_zen[1] - pal.sky_hor[1]) * t,
-                          pal.sky_hor[2] + (pal.sky_zen[2] - pal.sky_hor[2]) * t);
-                glVertex3f(fl.x + cosf(a) * cosf(e) * R, fl.y + sinf(e) * R, fl.z + sinf(a) * cosf(e) * R);
-            }
+/* camera -> world rotation, column-major 3x3 */
+static void cam_rot(float m[9]) {
+    float cy = cosf(fl.yaw), sy = sinf(fl.yaw), cp = cosf(fl.pitch), sp = sinf(fl.pitch), cr = cosf(fl.roll), sr = sinf(fl.roll);
+    /* Ry(yaw) * Rx(pitch) * Rz(roll) */
+    float Ry[9] = {cy, 0, -sy, 0, 1, 0, sy, 0, cy};
+    float Rx[9] = {1, 0, 0, 0, cp, sp, 0, -sp, cp};
+    float Rz[9] = {cr, sr, 0, -sr, cr, 0, 0, 0, 1};
+    float t[9];
+    for (int c = 0; c < 3; c++)
+        for (int r = 0; r < 3; r++) {
+            t[c * 3 + r] = 0;
+            for (int k = 0; k < 3; k++) t[c * 3 + r] += Rx[k * 3 + r] * Rz[c * 3 + k];
         }
-        glEnd();
-    }
-    /* sun: a flat disc on the dome */
-    float sx = fl.x + pal.sun_dir[0] * R * 0.95f, sy = fl.y + pal.sun_dir[1] * R * 0.95f,
-          sz = fl.z + pal.sun_dir[2] * R * 0.95f;
-    float ux = -pal.sun_dir[2], uz = pal.sun_dir[0], ul = sqrtf(ux * ux + uz * uz);
-    ux /= ul; uz /= ul;                       /* horizontal axis */
-    float vx = -pal.sun_dir[1] * uz, vy = pal.sun_dir[2] * ux - pal.sun_dir[0] * uz, vz = pal.sun_dir[1] * ux;
-    float rad = R * 0.035f;
-    glBegin(GL_TRIANGLE_FAN);
-    glColor3fv(pal.sun);
-    glVertex3f(sx, sy, sz);
-    for (int s = 0; s <= 24; s++) {
-        float a = s * 2 * (float)M_PI / 24;
-        glVertex3f(sx + (ux * cosf(a) + vx * sinf(a)) * rad, sy + vy * sinf(a) * rad,
-                   sz + (uz * cosf(a) + vz * sinf(a)) * rad);
-    }
-    glEnd();
-    glDepthMask(GL_TRUE);
-    glEnable(GL_DEPTH_TEST);
-    glShadeModel(GL_FLAT);
+    for (int c = 0; c < 3; c++)
+        for (int r = 0; r < 3; r++) {
+            m[c * 3 + r] = 0;
+            for (int k = 0; k < 3; k++) m[c * 3 + r] += Ry[k * 3 + r] * t[c * 3 + k];
+        }
+}
+
+static float view_tan[4], rot3[9], vp[16];
+
+static void setup_matrices(void) {
+    float l = (view_x - cam_cx) / cam_f, r = (view_x + view_w - cam_cx) / cam_f;
+    float b = (cam_cy - view_y - view_h) / cam_f, t = (cam_cy - view_y) / cam_f;
+    view_tan[0] = l; view_tan[1] = b; view_tan[2] = r - l; view_tan[3] = t - b;
+    cam_rot(rot3);
+    /* view = R^T * translate(0, -camY, 0); reversed-Z infinite projection */
+    float V[16] = {0};
+    for (int c = 0; c < 3; c++)
+        for (int rr = 0; rr < 3; rr++) V[c * 4 + rr] = rot3[rr * 3 + c];
+    for (int rr = 0; rr < 3; rr++) V[12 + rr] = -V[4 + rr] * fl.y;
+    V[15] = 1;
+    float n = 1.5f, P[16] = {0};
+    P[0] = 2 / (r - l); P[8] = (r + l) / (r - l);
+    P[5] = 2 / (t - b); P[9] = (t + b) / (t - b);
+    P[14] = n; P[11] = -1;
+    for (int c = 0; c < 4; c++)
+        for (int rr = 0; rr < 4; rr++) {
+            vp[c * 4 + rr] = 0;
+            for (int k = 0; k < 4; k++) vp[c * 4 + rr] += P[k * 4 + rr] * V[c * 4 + k];
+        }
+}
+
+static float sim_time;
+
+static void set_common(GLuint p) {
+    glUseProgram(p);
+    glUniform3fv(UL(p, "uSunDir"), 1, pal.sun_dir);
+    glUniform3fv(UL(p, "uSunCol"), 1, pal.sun);
+    glUniform3fv(UL(p, "uZen"), 1, pal.zen);
+    glUniform3fv(UL(p, "uHor"), 1, pal.hor);
+    glUniform3fv(UL(p, "uHorSun"), 1, pal.hor_sun);
+    glUniform3fv(UL(p, "uAmbSky"), 1, pal.amb_sky);
+    glUniform3fv(UL(p, "uAmbGnd"), 1, pal.amb_gnd);
+    glUniform1f(UL(p, "uCamY"), fl.y);
+    glUniform1f(UL(p, "uTime"), fmodf(sim_time, 4096.0f));
+    glUniform1f(UL(p, "uFogA"), pal.fog_a);
+    glUniform1f(UL(p, "uFogB"), pal.fog_b);
+    glUniform1f(UL(p, "uHaze"), pal.haze);
+    glUniform1f(UL(p, "uFogFar"), FOG_FAR);
+    glUniform1f(UL(p, "uGlow"), pal.glow);
+    glUniform1f(UL(p, "uStars"), pal.stars);
+    glUniform1f(UL(p, "uDisc"), pal.disc);
+    glUniform2f(UL(p, "uWorldMod"), (float)fmod(fl.x, 16384.0), (float)fmod(fl.z, 16384.0));
+    /* wind: clouds drift ~6 m/s */
+    double wx = fl.x + sim_time * 5.0, wz = fl.z + sim_time * 3.0;
+    glUniform2f(UL(p, "uCloudMod"), (float)fmod(wx, 16384.0), (float)fmod(wz, 16384.0));
+    glUniform1f(UL(p, "uCloudBase"), pal.cbase);
+    glUniform1f(UL(p, "uCloudThick"), pal.cthick);
+    glUniform1f(UL(p, "uCloudCover"), pal.cover);
+    glUniform1f(UL(p, "uCloudDens"), pal.cdens);
+    glUniform1f(UL(p, "uCloudsOn"), (float)opt_clouds);
+    glUniform2f(UL(p, "uT0Cam"), (float)fmod(fl.x / BASE, 512.0), (float)fmod(fl.z / BASE, 512.0));
+    glUniform2f(UL(p, "uT1Cam"), (float)fmod(fl.x / (4 * BASE), 1024.0), (float)fmod(fl.z / (4 * BASE), 1024.0));
+    glUniformMatrix4fv(UL(p, "uVP"), 1, GL_FALSE, vp);
+}
+
+static int bake_row = -1;                 /* -1: bake everything next frame */
+static void bake_step(void) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_bake);
+    glViewport(0, 0, 1024, 1024);
+    glUseProgram(p_bake);
+    glUniform3fv(UL(p_bake, "uSunDir"), 1, pal.sun_dir);
+    glUniform2i(UL(p_bake, "uOrg1"), hm[1].ox, hm[1].oz);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glBindVertexArray(vao_empty);
+    if (bake_row >= 0) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, bake_row, 1024, 64);
+        bake_row = (bake_row + 64) & 1023;
+    } else bake_row = 0;
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_SCISSOR_TEST);
 }
 
 static void draw_terrain(void) {
-    int32_t cx = (int32_t)floorf(fl.x / CELL), cz = (int32_t)floorf(fl.z / CELL);
-    float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw);
-    int n = 0;
-    for (int32_t gz = cz - HALF; gz <= cz + HALF; gz++) {
-        for (int32_t gx = cx - HALF; gx <= cx + HALF; gx++) {
-            float dx = (gx - cx) * CELL, dz = (gz - cz) * CELL;
-            if (dx * dx + dz * dz > FAR * FAR) continue;
-            /* skip what's well behind us (keep a margin for the wide FOV + bank) */
-            if (dx * fx + dz * fz < -3 * CELL && (dx * dx + dz * dz) > 36 * CELL * CELL) continue;
-            memcpy(verts + n * 36, get_cell(gx, gz)->v, sizeof(float) * 36);
-            n++;
+    set_common(p_terr);
+    int32_t ccx = (int32_t)floor(fl.x / BASE), ccz = (int32_t)floor(fl.z / BASE);
+    glUniform2i(UL(p_terr, "uCamCell"), ccx, ccz);
+    glUniform2f(UL(p_terr, "uCamFrac"), (float)(fl.x - ccx * BASE), (float)(fl.z - ccz * BASE));
+    glUniform1i(UL(p_terr, "uNQ"), NQ);
+    GLint l_org = UL(p_terr, "uOrg"), l_mul = UL(p_terr, "uMul"), l_sel = UL(p_terr, "uTexSel"),
+          l_hole = UL(p_terr, "uHole"), l_morph = UL(p_terr, "uMorph");
+    glBindVertexArray(vao_terr);
+    int32_t prev_ox = 0, prev_oz = 0;
+    for (int k = 0; k < LEVELS; k++) {
+        int mul = 1 << k;
+        double sp = BASE * mul;
+        int32_t ox = ((int32_t)floor(fl.x / sp) - NQ / 2) & ~1, oz = ((int32_t)floor(fl.z / sp) - NQ / 2) & ~1;
+        glUniform2i(l_org, ox, oz);
+        glUniform1i(l_mul, mul);
+        glUniform1i(l_sel, k < 2 ? 0 : 1);
+        glUniform1f(l_morph, k < LEVELS - 1 ? 1.0f : 0.0f);
+        if (k == 0) glUniform4i(l_hole, 0, 0, 0, 0);
+        else {
+            int32_t hx = prev_ox / 2 - ox, hz = prev_oz / 2 - oz;
+            glUniform4i(l_hole, hx, hz, hx + NQ / 2, hz + NQ / 2);
         }
+        glDrawArrays(GL_TRIANGLES, 0, terr_nverts);
+        prev_ox = ox; prev_oz = oz;
     }
-    glEnable(GL_FOG);
-    glInterleavedArrays(GL_C3F_V3F, 0, verts);
-    glDrawArrays(GL_TRIANGLES, 0, n * 6);
 }
-
-/* One flat-shaded triangle, its normal flipped to face away from `in`. */
-static float *emit(float *o, const float a[3], const float b[3], const float c[3],
-                   const float col[3], const float in[3], float amb, float lit) {
-    float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-    float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
-    float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    float nl = sqrtf(nx * nx + ny * ny + nz * nz);
-    if (nl < 1e-6f) return o;
-    float mx = (a[0] + b[0] + c[0]) / 3 - in[0], my = (a[1] + b[1] + c[1]) / 3 - in[1], mz = (a[2] + b[2] + c[2]) / 3 - in[2];
-    if (nx * mx + ny * my + nz * mz < 0) nl = -nl;
-    float lam = (nx * pal.sun_dir[0] + ny * pal.sun_dir[1] + nz * pal.sun_dir[2]) / nl;
-    lam = lam < 0 ? 0 : lam * lit;
-    const float *p[3] = {a, b, c};
-    for (int i = 0; i < 3; i++, o += 6) {
-        for (int k = 0; k < 3; k++) o[k] = fminf(1, col[k] * (amb + lam * pal.light[k]));
-        o[3] = p[i][0]; o[4] = p[i][1]; o[5] = p[i][2];
-    }
-    return o;
-}
-
-/* 5-sided cone from a ring at yb to the apex at ya (ya < yb points it down). */
-static float *cone(float *o, float x, float z, float r, float yb, float ya, float rot, const float col[3], float lit) {
-    float apex[3] = {x, ya, z}, in[3] = {x, yb + (ya - yb) * 0.25f, z}, ring[6][3];
-    for (int s = 0; s <= 5; s++) {
-        float a = rot + s * 2 * (float)M_PI / 5;
-        ring[s][0] = x + cosf(a) * r; ring[s][1] = yb; ring[s][2] = z + sinf(a) * r;
-    }
-    for (int s = 0; s < 5; s++) o = emit(o, ring[s], ring[s + 1], apex, col, in, pal.ambient, lit);
-    return o;
-}
-
-static float *trunk(float *o, float x, float z, float r, float y0, float y1, float rot, float lit) {
-    static const float col[3] = {.36f, .26f, .16f};
-    float in[3] = {x, (y0 + y1) / 2, z}, b[4][3], t[4][3];
-    for (int s = 0; s <= 3; s++) {
-        float a = rot + s * 2 * (float)M_PI / 3;
-        b[s][0] = t[s][0] = x + cosf(a) * r; b[s][2] = t[s][2] = z + sinf(a) * r;
-        b[s][1] = y0; t[s][1] = y1;
-    }
-    for (int s = 0; s < 3; s++) {
-        o = emit(o, b[s], b[s + 1], t[s], col, in, pal.ambient, lit);
-        o = emit(o, b[s + 1], t[s + 1], t[s], col, in, pal.ambient, lit);
-    }
-    return o;
-}
-
-#define TREE_R 96                /* cells; trees grow in over the last 20% */
-#define MAX_TREES 30000
-#define TREE_TRIS 16
-static float *tverts;
 
 static void draw_trees(void) {
-    static const float pine[3] = {.11f, .28f, .14f}, leaf[3] = {.24f, .44f, .15f};
-    int32_t cx = (int32_t)floorf(fl.x / CELL), cz = (int32_t)floorf(fl.z / CELL);
-    float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw), R = TREE_R * CELL;
-    float *o = tverts;
-    int count = 0;
-    for (int32_t gz = cz - TREE_R; gz <= cz + TREE_R; gz++) {
-        for (int32_t gx = cx - TREE_R; gx <= cx + TREE_R; gx++) {
-            float dx = (gx - cx) * CELL, dz = (gz - cz) * CELL, d2 = dx * dx + dz * dz;
-            if (d2 > R * R) continue;
-            if (dx * fx + dz * fz < -3 * CELL && d2 > 36 * CELL * CELL) continue;
-            Cell *c = get_cell(gx, gz);
-            if (!c->nt) continue;
-            float fade = smoothstep(R, R * 0.8f, sqrtf(d2));
-            for (int t = 0; t < c->nt && count < MAX_TREES; t++, count++) {
-                const float *p = c->tr[t];
-                float x = p[0], y = p[1], z = p[2], h = p[3] * fade, r = p[4] * fade, rot = x * 0.37f + z * 0.61f;
-                if (h < 0.5f) continue;
-                const float *base = p[5] ? pine : leaf;
-                float col[3] = {base[0] * p[6], base[1] * p[6], base[2] * p[6]};
-                if (p[5]) {
-                    o = trunk(o, x, z, r * 0.14f, y, y + 0.25f * h, rot, c->lit);
-                    o = cone(o, x, z, r, y + 0.15f * h, y + 0.72f * h, rot, col, c->lit);
-                    o = cone(o, x, z, r * 0.68f, y + 0.48f * h, y + h, rot + 0.6f, col, c->lit);
-                } else {
-                    o = trunk(o, x, z, r * 0.12f, y, y + 0.4f * h, rot, c->lit);
-                    o = cone(o, x, z, r, y + 0.62f * h, y + h, rot, col, c->lit);
-                    o = cone(o, x, z, r, y + 0.62f * h, y + 0.28f * h, rot, col, c->lit);
-                }
-            }
+    set_common(p_tree);
+    glUniform1f(UL(p_tree, "uTreeR"), TREE_R);
+    glEnable(GL_CULL_FACE);
+    int off = 0;
+    for (int k = 0; k < 4; k++) {
+        if (tree_count[k]) {
+            glBindVertexArray(vao_tree[k]);
+            glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 0, tmesh[k].n, tree_count[k], off);
         }
+        off += tree_count[k];
     }
-    glInterleavedArrays(GL_C3F_V3F, 0, tverts);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)((o - tverts) / 6));
+    glDisable(GL_CULL_FACE);
 }
 
-#define CLOUD_R ((int)(FAR / CG) + 2)
-#define PSEG 8
-#define PUFF_TRIS (PSEG * 6)
-static float *cverts;
-
-/* A puff: a jittered, flattened dome (staggered rings) on a flat base. */
-static float *puff(float *o, const Cloud *c, int k, int32_t i, int32_t j, float amb) {
-    static const float col[3] = {.96f, .97f, 1.0f};
-    float cx = c->x + c->p[k][0], cz = c->z + c->p[k][1], r = c->p[k][2], hs = c->p[k][3], y0 = c->base;
-    float v[3][PSEG + 1][3];
-    for (int ring = 0; ring < 3; ring++) {
-        float e = ring * (float)M_PI / 6;
-        for (int s = 0; s < PSEG; s++) {
-            float jit = 0.82f + 0.3f * rand01(i * 64 + k * 8 + ring, j * 16 + s, 220);
-            float a = (s + 0.5f * (ring & 1)) * 2 * (float)M_PI / PSEG, rr = r * cosf(e) * jit;
-            v[ring][s][0] = cx + cosf(a) * rr;
-            v[ring][s][1] = y0 + r * hs * sinf(e) * jit;
-            v[ring][s][2] = cz + sinf(a) * rr;
-        }
-        memcpy(v[ring][PSEG], v[ring][0], sizeof v[ring][0]);
-    }
-    float apex[3] = {cx, y0 + r * hs * (0.95f + 0.1f * rand01(i * 64 + k, j, 221)), cz};
-    float mid[3] = {cx, y0, cz}, in[3] = {cx, y0 + r * hs * 0.3f, cz};
-    for (int s = 0; s < PSEG; s++) {
-        o = emit(o, v[0][s], v[0][s + 1], mid, col, in, amb, 1);
-        for (int ring = 0; ring < 2; ring++) {
-            o = emit(o, v[ring][s], v[ring][s + 1], v[ring + 1][s], col, in, amb, 1);
-            o = emit(o, v[ring][s + 1], v[ring + 1][s + 1], v[ring + 1][s], col, in, amb, 1);
-        }
-        o = emit(o, v[2][s], v[2][s + 1], apex, col, in, amb, 1);
-    }
-    return o;
+static void draw_water(void) {
+    set_common(p_water);
+    glUniform1f(UL(p_water, "uExtent"), FOG_FAR);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(vao_water);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
 }
 
-static void draw_clouds(void) {
-    int32_t ci = (int32_t)floorf(fl.x / CG), cj = (int32_t)floorf(fl.z / CG);
-    float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw), amb = pal.ambient + 0.3f;
-    float *o = cverts;
-    for (int32_t j = cj - CLOUD_R; j <= cj + CLOUD_R; j++) {
-        for (int32_t i = ci - CLOUD_R; i <= ci + CLOUD_R; i++) {
-            Cloud c;
-            if (!get_cloud(i, j, &c)) continue;
-            float dx = c.x - fl.x, dz = c.z - fl.z, d2 = dx * dx + dz * dz;
-            if (d2 > (FAR + 400) * (FAR + 400)) continue;
-            if (dx * fx + dz * fz < -600 && d2 > 800 * 800) continue;
-            for (int k = 0; k < c.n; k++) o = puff(o, &c, k, i, j, amb);
-        }
+static void fullscreen(void) {
+    glBindVertexArray(vao_empty);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+static void post(GLuint target) {
+    glDisable(GL_DEPTH_TEST);
+    /* bloom: soft-threshold downsample chain, then tent upsample back */
+    glUseProgram(p_down);
+    glActiveTexture(GL_TEXTURE5);
+    for (int i = 0; i < NBLOOM; i++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_bloom[i]);
+        glViewport(0, 0, bloom_w[i], bloom_h[i]);
+        int sw = i ? bloom_w[i - 1] : scene_w, sh = i ? bloom_h[i - 1] : scene_h;
+        glBindTexture(GL_TEXTURE_2D, i ? tex_bloom[i - 1] : tex_scene);
+        glUniform2f(UL(p_down, "uTexel"), 1.0f / sw, 1.0f / sh);
+        glUniform1f(UL(p_down, "uPrefilter"), i ? 0.0f : 1.2f);
+        fullscreen();
     }
-    glInterleavedArrays(GL_C3F_V3F, 0, cverts);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)((o - cverts) / 6));
+    glUseProgram(p_up);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    for (int i = NBLOOM - 1; i > 0; i--) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_bloom[i - 1]);
+        glViewport(0, 0, bloom_w[i - 1], bloom_h[i - 1]);
+        glBindTexture(GL_TEXTURE_2D, tex_bloom[i]);
+        glUniform2f(UL(p_up, "uTexel"), 1.0f / bloom_w[i], 1.0f / bloom_h[i]);
+        fullscreen();
+    }
+    glDisable(GL_BLEND);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, target);
+    glViewport(0, 0, W, H);
+    glUseProgram(p_post);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, tex_scene);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, tex_bloom[0]);
+    glActiveTexture(GL_TEXTURE7);       /* scratch unit for uploads */
+    glUniform2f(UL(p_post, "uTexel"), 1.0f / scene_w, 1.0f / scene_h);
+    glUniform1f(UL(p_post, "uExposure"), pal.exposure);
+    glUniform1f(UL(p_post, "uBloomAmt"), 0.06f);
+    glUniform1f(UL(p_post, "uSat"), pal.sat);
+    glUniform1f(UL(p_post, "uSharpen"), scene_w < W ? 0.5f : 0.0f);
+    glUniform4f(UL(p_post, "uVig"), (view_x - lay_x0) / lay_w, (lay_y0 + lay_h - view_y - view_h) / lay_h, view_w / lay_w, view_h / lay_h);
+    fullscreen();
 }
 
 /* 7-segment vector digits for the HUD */
@@ -597,10 +1472,12 @@ static void draw_hud(void) {
     float s = hud_h / 720.0f;
     /* canvas units, origin at the camera centre, y up */
     float ox = view_x - cam_cx, oy = cam_cy - view_y - view_h, px = W / view_w, py = H / view_h;
+    glUseProgram(0);
+    glBindVertexArray(0);
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glOrtho(ox, ox + view_w, oy, oy + view_h, -1, 1);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    glDisable(GL_DEPTH_TEST); glDisable(GL_FOG);
+    glDisable(GL_DEPTH_TEST);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
     glLineWidth(fmaxf(1.5f, 2.2f * s * px));
@@ -648,20 +1525,20 @@ static void draw_hud(void) {
 
     /* heading tape */
     float hdg = fmodf(-fl.yaw * DEG, 360); if (hdg < 0) hdg += 360;
-    float top = hud_h / 2 - 60 * s, span = 150 * s, ppd = 7 * s;
+    float top = hud_h / 2 - 60 * s, span_ = 150 * s, ppd = 7 * s;
     glBegin(GL_LINES);
-    for (int d = (int)floorf(hdg - span / ppd); d <= (int)ceilf(hdg + span / ppd); d++) {
+    for (int d = (int)floorf(hdg - span_ / ppd); d <= (int)ceilf(hdg + span_ / ppd); d++) {
         if (d % 5) continue;
         float x = (d - hdg) * ppd;
-        if (fabsf(x) > span) continue;
+        if (fabsf(x) > span_) continue;
         glVertex2f(x, top); glVertex2f(x, top + (d % 10 ? 7 : 13) * s);
     }
     glVertex2f(0, top - 4 * s); glVertex2f(-6 * s, top - 14 * s);
     glVertex2f(0, top - 4 * s); glVertex2f(6 * s, top - 14 * s);
     glEnd();
-    for (int d = (int)floorf((hdg - span / ppd) / 10) * 10; d <= hdg + span / ppd; d += 10) {
+    for (int d = (int)floorf((hdg - span_ / ppd) / 10) * 10; d <= hdg + span_ / ppd; d += 10) {
         float x = (d - hdg) * ppd;
-        if (fabsf(x) > span - 10 * s) continue;
+        if (fabsf(x) > span_ - 10 * s) continue;
         int lab = ((d % 360) + 360) % 360 / 10;
         seg_number(x - 9 * s, top + 18 * s, 13 * s, lab, 2, 0);
     }
@@ -677,50 +1554,141 @@ static void draw_hud(void) {
         seg_number(x1 - 10 * s, -9 * s, 18 * s, v, side < 0 ? 3 : 4, 1);
     }
     glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
 }
 
-static void render(void) {
+static float render_scale = 1.0f;
+
+static void render(GLuint target) {
     setup_view();
-    glViewport(0, 0, W, H);
-    glClearColor(pal.sky_hor[0], pal.sky_hor[1], pal.sky_hor[2], 1);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    setup_matrices();
+    hm_update(&hm[0], fl.x, fl.z);
+    hm_update(&hm[1], fl.x, fl.z);
+    if (opt_trees) trees_update();
+    bake_step();
 
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    float nearp = 2, k = nearp / cam_f;
-    glFrustum((view_x - cam_cx) * k, (view_x + view_w - cam_cx) * k,
-              (cam_cy - view_y - view_h) * k, (cam_cy - view_y) * k, nearp, FAR * 1.1f);
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    glRotatef(-fl.roll * DEG, 0, 0, 1);
-    glRotatef(-fl.pitch * DEG, 1, 0, 0);
-    glRotatef(-fl.yaw * DEG, 0, 1, 0);
-    glTranslatef(-fl.x, -fl.y, -fl.z);
+    int sw = (int)(W * render_scale + 0.5f), sh = (int)(H * render_scale + 0.5f);
+    resize_scene(sw < 16 ? 16 : sw, sh < 16 ? 16 : sh);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene);
+    glViewport(0, 0, scene_w, scene_h);
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    glClearDepth(0);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDepthFunc(GL_GREATER);
 
-    draw_sky();
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    set_common(p_sky);
+    glUniform4fv(UL(p_sky, "uViewTan"), 1, view_tan);
+    glUniformMatrix3fv(UL(p_sky, "uCamRot"), 1, GL_FALSE, rot3);
+    fullscreen();
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+
     draw_terrain();
     if (opt_trees) draw_trees();
-    if (opt_clouds) draw_clouds();
+    draw_water();
+
+    glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+    glDepthFunc(GL_LESS);
+    post(target);
     if (opt_hud) draw_hud();
 }
 
-static void choose_palette(void) {
-    int dusk = !strcmp(opt_time, "dusk") || (!strcmp(opt_time, "random") && (opt_seed & 1));
-    float el, az;
-    if (dusk) {
-        pal = (Palette){{.16f, .14f, .38f}, {.98f, .62f, .38f}, {1, .86f, .55f}, {0}, {1.05f, .72f, .52f}, .30f};
-        el = 7; az = 200;
-    } else {
-        pal = (Palette){{.18f, .38f, .80f}, {.72f, .84f, .95f}, {1, 1, .92f}, {0}, {.85f, .85f, .80f}, .42f};
-        el = 38; az = 150;
+static void gl_init(void) {
+    const char *ver = (const char *)glGetString(GL_VERSION);
+    int major = 0, minor = 0;
+    if (!ver || sscanf(ver, "%d.%d", &major, &minor) != 2 || major * 10 + minor < 45) {
+        fprintf(stderr, "flightsim: needs OpenGL 4.5 (got %s)\n", ver ? ver : "none");
+        exit(1);
     }
-    pal.sun_dir[0] = cosf(el / DEG) * sinf(az / DEG);
-    pal.sun_dir[1] = sinf(el / DEG);
-    pal.sun_dir[2] = cosf(el / DEG) * cosf(az / DEG);
-    float fog[4] = {pal.sky_hor[0], pal.sky_hor[1], pal.sky_hor[2], 1};
-    glFogi(GL_FOG_MODE, GL_LINEAR);
-    glFogfv(GL_FOG_COLOR, fog);
-    glFogf(GL_FOG_START, FAR * 0.30f);
-    glFogf(GL_FOG_END, FAR * 0.97f);
+    GLSL_COMMON = COMMON_SRC;
+    p_sky = program("sky", VS_FULL, FS_SKY);
+    p_terr = program("terrain", VS_TERRAIN, FS_TERRAIN);
+    p_water = program("water", VS_WATER, FS_WATER);
+    p_tree = program("tree", VS_TREE, FS_TREE);
+    p_bake = program("bake", VS_FULL, FS_BAKE);
+    p_down = program("down", VS_FULL, FS_DOWN);
+    p_up = program("up", VS_FULL, FS_UP);
+    p_post = program("post", VS_FULL, FS_POST);
+    glGenVertexArrays(1, &vao_empty);
+
+    /* heightmaps */
+    for (int i = 0; i < 2; i++) {
+        HMap *m = &hm[i];
+        m->data = calloc((size_t)m->n * m->n * 2, sizeof(float));
+        m->tex = mk_tex2d(GL_RG32F, m->n, m->n, GL_RG, GL_FLOAT, NULL, GL_LINEAR, GL_REPEAT);
+    }
+    tex_shadow = mk_tex2d(GL_RG8, 1024, 1024, GL_RG, GL_UNSIGNED_BYTE, NULL, GL_LINEAR, GL_REPEAT);
+    fbo_bake = mk_fbo(tex_shadow);
+    make_noise();
+    GLuint units[5] = {hm[0].tex, hm[1].tex, tex_shadow, tex_noise2, tex_noise3};
+    for (int i = 0; i < 5; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(i == 4 ? GL_TEXTURE_3D : GL_TEXTURE_2D, units[i]);
+    }
+    glActiveTexture(GL_TEXTURE7);       /* scratch unit for uploads */
+
+    /* clipmap grid: every quad as 2 triangles, each vertex tagged with its quad */
+    terr_nverts = NQ * NQ * 6;
+    short *g = malloc(sizeof(short) * 4 * terr_nverts), *o = g;
+    for (int qz = 0; qz < NQ; qz++)
+        for (int qx = 0; qx < NQ; qx++) {
+            int c[6][2];
+            if ((qx + qz) & 1) {
+                int t[6][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 0}, {0, 1}, {1, 1}};
+                memcpy(c, t, sizeof c);
+            } else {
+                int t[6][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 0}, {0, 1}, {1, 1}};
+                memcpy(c, t, sizeof c);
+            }
+            for (int v = 0; v < 6; v++) {
+                *o++ = (short)(qx + c[v][0]); *o++ = (short)(qz + c[v][1]);
+                *o++ = (short)qx; *o++ = (short)qz;
+            }
+        }
+    GLuint vbo;
+    glGenVertexArrays(1, &vao_terr);
+    glBindVertexArray(vao_terr);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(short) * 4 * terr_nverts, g, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribIPointer(0, 2, GL_SHORT, 8, (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribIPointer(1, 2, GL_SHORT, 8, (void *)4);
+    free(g);
+
+    static const float wq[12] = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    glGenVertexArrays(1, &vao_water);
+    glBindVertexArray(vao_water);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof wq, wq, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+
+    /* trees */
+    gen_pine(&tmesh[0], 4, 9, 1);
+    gen_pine(&tmesh[1], 2, 5, 0);
+    gen_broadleaf(&tmesh[2], 1);
+    gen_broadleaf(&tmesh[3], 0);
+    glGenBuffers(1, &vbo_tree_inst);
+    for (int k = 0; k < 4; k++) {
+        glGenVertexArrays(1, &vao_tree[k]);
+        glBindVertexArray(vao_tree[k]);
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 7 * tmesh[k].n, tmesh[k].v, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 28, (void *)0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 28, (void *)12);
+        glEnableVertexAttribArray(2); glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 28, (void *)24);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_tree_inst);
+        glEnableVertexAttribArray(3); glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, 32, (void *)0);
+        glEnableVertexAttribArray(4); glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, 32, (void *)16);
+        glVertexAttribDivisor(3, 1);
+        glVertexAttribDivisor(4, 1);
+    }
+    glBindVertexArray(0);
 }
 
 static double now(void) {
@@ -749,10 +1717,36 @@ static void parse_layout(const char *str) {
 static void usage(void) {
     fprintf(stderr,
         "usage: flightsim [--window | --root] [--no-hud] [--no-trees] [--no-clouds]\n"
-        "                 [--time day|dusk|random]\n"
+        "                 [--time day|golden|dusk|night|random]\n"
         "                 [--speed X] [--fov DEG] [--seed N] [--epoch UNIXTIME]\n"
-        "                 [--layout 'x,y,w,h;x,y,w,h;...' --output INDEX]\n");
+        "                 [--scale X]   (fixed render scale; default adapts to the frame budget)\n"
+        "                 [--layout 'x,y,w,h;x,y,w,h;...' --output INDEX]\n"
+        "                 [--shot FILE.ppm | --bench FRAMES] [--size WxH] [--at SECONDS]\n");
     exit(1);
+}
+
+/* fixed-step sim: the state at time t depends only on seed + t */
+static const double STEP = 1.0 / 120;
+static long steps;
+static void advance(double t) {
+    while ((steps + 1) * STEP <= t) {
+        fly((float)STEP, (float)(steps * STEP));
+        steps++;
+    }
+    sim_time = (float)(steps * STEP);
+}
+
+static void save_ppm(const char *path) {
+    unsigned char *px = malloc((size_t)W * H * 3);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_final);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    fprintf(f, "P6\n%d %d\n255\n", W, H);
+    for (int y = H - 1; y >= 0; y--) fwrite(px + (size_t)y * W * 3, 1, (size_t)W * 3, f);
+    fclose(f);
+    free(px);
 }
 
 int main(int argc, char **argv) {
@@ -768,10 +1762,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-time") && i + 1 < argc) opt_time = argv[++i];
         else if (!strcmp(a, "-speed") && i + 1 < argc) opt_speed = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-fov") && i + 1 < argc) { opt_fov = strtof(argv[++i], NULL); opt_fov_set = 1; }
+        else if (!strcmp(a, "-scale") && i + 1 < argc) opt_scale = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-epoch") && i + 1 < argc) opt_epoch = strtod(argv[++i], NULL);
         else if (!strcmp(a, "-layout") && i + 1 < argc) parse_layout(argv[++i]);
         else if (!strcmp(a, "-output") && i + 1 < argc) span_me = atoi(argv[++i]);
         else if (!strcmp(a, "-seed") && i + 1 < argc) opt_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "-shot") && i + 1 < argc) opt_shot = argv[++i];
+        else if (!strcmp(a, "-bench") && i + 1 < argc) opt_bench = atoi(argv[++i]);
+        else if (!strcmp(a, "-size") && i + 1 < argc) { if (sscanf(argv[++i], "%dx%d", &off_w, &off_h) != 2) usage(); }
+        else if (!strcmp(a, "-at") && i + 1 < argc) opt_at = strtod(argv[++i], NULL);
         else usage();
     }
     if (span_me >= span_n) span_me = -1;
@@ -779,15 +1778,17 @@ int main(int argc, char **argv) {
     rng_state = opt_seed;
     seed_x = (frand() - 0.5f) * 2e5f;
     seed_z = (frand() - 0.5f) * 2e5f;
-    cloud_off_x = (int32_t)(seed_x / CG); cloud_off_z = (int32_t)(seed_z / CG);
+    int offscreen = opt_shot || opt_bench;
+    long nc = sysconf(_SC_NPROCESSORS_ONLN);
+    nthreads = nc > 1 ? (int)nc : 1;
+    if (!offscreen && nthreads > 8) nthreads = 8;   /* be polite when there are several of us */
 
     Display *dpy = XOpenDisplay(NULL);
     if (!dpy) { fprintf(stderr, "flightsim: can't open display\n"); return 1; }
     int scr = DefaultScreen(dpy);
     Window root = RootWindow(dpy, scr);
-    int attrs[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_DEPTH_SIZE, 24, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
+    int attrs[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
     XVisualInfo *vi = glXChooseVisual(dpy, scr, attrs);
-    if (!vi) { attrs[3] = 16; vi = glXChooseVisual(dpy, scr, attrs); }
     if (!vi) { fprintf(stderr, "flightsim: no suitable GLX visual\n"); return 1; }
 
     XWindowAttributes ra;
@@ -797,39 +1798,58 @@ int main(int argc, char **argv) {
     swa.event_mask = StructureNotifyMask | KeyPressMask | ExposureMask;
     swa.override_redirect = opt_root;
     if (opt_root) { W = ra.width; H = ra.height; XSelectInput(dpy, root, StructureNotifyMask); }
-    Window win = XCreateWindow(dpy, root, 0, 0, W, H, 0, vi->depth, InputOutput, vi->visual,
+    if (offscreen) { W = off_w; H = off_h; }
+    Window win = XCreateWindow(dpy, root, 0, 0, offscreen ? 64 : W, offscreen ? 64 : H, 0, vi->depth, InputOutput, vi->visual,
                                CWColormap | CWEventMask | CWOverrideRedirect, &swa);
     XStoreName(dpy, win, "Flight Sim");
     XClassHint ch = {"flightsim", "Flightsim"};
     XSetClassHint(dpy, win, &ch);
     Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
-    XMapRaised(dpy, win);
+    if (!offscreen) XMapRaised(dpy, win);
 
     GLXContext ctx = glXCreateContext(dpy, vi, NULL, True);
     glXMakeCurrent(dpy, win, ctx);
-
-    cache = malloc(sizeof(Cell) * RING * RING);
-    for (int i = 0; i < RING * RING; i++) cache[i].gx = cache[i].gz = INT32_MIN;
-    verts = malloc(sizeof(float) * 36 * (2 * HALF + 1) * (2 * HALF + 1));
-    tverts = malloc(sizeof(float) * 18 * TREE_TRIS * MAX_TREES);
-    cverts = malloc(sizeof(float) * 18 * PUFF_TRIS * PUFFS * (2 * CLOUD_R + 1) * (2 * CLOUD_R + 1));
-
-    glEnable(GL_DEPTH_TEST);
-    glShadeModel(GL_FLAT);
     choose_palette();
+    gl_init();
 
     fl.speed = 150 * opt_speed;
     fl.yaw = frand() * 2 * (float)M_PI;
     fl.y = ground(0, 0) + 150;
     pick_route(0);
 
+    if (offscreen) {
+        tex_final = mk_tex2d(GL_RGBA8, W, H, GL_RGBA, GL_UNSIGNED_BYTE, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+        fbo_final = mk_fbo(tex_final);
+        render_scale = opt_scale > 0 ? opt_scale : 1.0f;
+        advance(opt_at);
+        render(fbo_final);                 /* warm-up: streams everything, full bake */
+        glFinish();
+        if (opt_shot) {
+            render(fbo_final);
+            save_ppm(opt_shot);
+            return 0;
+        }
+        double t0 = now(), worst = 0;
+        for (int i = 0; i < opt_bench; i++) {
+            double f0 = now();
+            advance(opt_at + (i + 1) / 60.0);
+            render(fbo_final);
+            glFinish();
+            worst = fmax(worst, now() - f0);
+        }
+        double per = (now() - t0) / opt_bench;
+        printf("%dx%d scale %.2f: %.2f ms/frame avg, %.2f worst (%s)\n", W, H, render_scale, per * 1e3, worst * 1e3,
+               (const char *)glGetString(GL_RENDERER));
+        return 0;
+    }
+
     /* Fixed-step sim clocked off the wall: the state at time t depends only on
      * seed + epoch + t, so separate instances stay in lockstep. */
-    const double STEP = 1.0 / 120;
     double epoch = opt_epoch ? opt_epoch : wallclock();
-    long steps = 0;
-    for (;;) {
+    render_scale = opt_scale > 0 ? opt_scale : 0.75f;
+    double avg = 1.0 / 60, last_change = 0;
+    for (int frame = 0;; frame++) {
         while (XPending(dpy)) {
             XEvent ev;
             XNextEvent(dpy, &ev);
@@ -844,13 +1864,22 @@ int main(int argc, char **argv) {
             }
         }
         double t = now();
-        double sim_t = wallclock() - epoch;
-        while ((steps + 1) * STEP <= sim_t) {
-            fly((float)STEP, (float)(steps * STEP));
-            steps++;
-        }
-        render();
+        advance(wallclock() - epoch + opt_at);
+        render(0);
+        glFinish();
+        double took = now() - t;
         glXSwapBuffers(dpy, win);
+
+        /* dynamic resolution: keep each frame well inside a 60 Hz budget,
+         * leaving room for the other instances sharing the GPU */
+        if (frame > 10) avg += (took - avg) * 0.1;
+        if (opt_scale <= 0 && frame > 30 && t - last_change > 0.5) {
+            float s = render_scale;
+            if (avg > 0.0125) s *= 0.9f;
+            else if (avg < 0.008) s *= 1.06f;
+            s = s < 0.35f ? 0.35f : s > 1.0f ? 1.0f : s;
+            if (fabsf(s - render_scale) > 0.02f) { render_scale = s; last_change = t; avg = 1.0 / 90; }
+        }
         double spare = 1.0 / 60 - (now() - t);
         if (spare > 0) {
             struct timespec ts = {0, (long)(spare * 1e9)};
