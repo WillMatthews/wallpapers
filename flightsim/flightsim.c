@@ -426,6 +426,7 @@ uniform vec3 uAmbSky; uniform vec3 uAmbGnd;
 uniform float uCamY; uniform float uTime;
 uniform float uFogA; uniform float uFogB; uniform float uHaze; uniform float uFogFar;
 uniform float uMist;                 /* valley mist density inside the layer (1/m); 0 = none */
+uniform float uMistTop0;             /* mistTop() under the camera */
 uniform float uGlow; uniform float uStars; uniform float uDisc;
 uniform vec2 uWorldMod; uniform vec2 uCloudMod;
 uniform float uCloudBase; uniform float uCloudThick; uniform float uCloudCover; uniform float uCloudDens; uniform float uCloudsOn;
@@ -496,7 +497,7 @@ float mistDepth(vec3 rd, float t) {
     if (uMist <= 0.0) return 0.0;
     vec3 e = rd * t;
     const float Hm = 20.0;
-    float u0 = uCamY - mistTop(vec2(0.0)), u1 = uCamY + e.y - mistTop(e.xz);
+    float u0 = uCamY - uMistTop0, u1 = uCamY + e.y - mistTop(e.xz);
     /* antiderivative of the density profile (over height above the top) */
     vec2 F = vec2(u0, u1);
     F = mix(F, Hm * (1.0 - exp(-F / Hm)), step(0.0, F));
@@ -504,7 +505,7 @@ float mistDepth(vec3 rd, float t) {
     float od = abs(du) > 1e-3 ? (F.y - F.x) / du : (u0 < 0.0 ? 1.0 : exp(-u0 / Hm));
     /* patchy, drifting slowly */
     vec2 w = uWorldMod + e.xz + vec2(uTime * 1.5, uTime * 0.6);
-    float patchy = texture(uNoise2, w / 4000.0).g * 0.75 + texture(uNoise2, w / 1200.0).b * 0.25;
+    float patchy = texture(uNoise2, w / 3000.0).g;
     /* none right round the camera: it's for looking down or across on, not
      * for flying blind through */
     return uMist * t * od * smoothstep(0.2, 0.8, patchy) * 1.6 * smoothstep(100.0, 600.0, t);
@@ -603,6 +604,20 @@ vec4 clouds(vec3 rd, float tmax, int steps, float jit) {
 /* baked terrain sun shadow (r) and ambient occlusion (g) */
 vec2 terrShadow(vec3 p) { return texture(uShadow, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0).rg; }
 
+/* atmos() as col * a + rgb (for per-vertex use: small things like trees) */
+vec4 atmosParts(vec3 rd, float t, int steps, float jit) {
+    float T = fogTrans(rd, t);
+    vec3 add = fogColor(rd) * (1.0 - T);
+    float Tm = max(exp(-mistDepth(rd, t)), 0.25);
+    add = add * Tm + mistColor(rd) * (1.0 - Tm);
+    float mul = T * Tm;
+    if (uCloudsOn > 0.5 && (uCamY > uCloudBase || rd.y > 0.0)) {
+        vec4 c = clouds(rd, t, steps, jit);
+        add = add * c.a + c.rgb;
+        mul *= c.a;
+    }
+    return vec4(add, mul);
+}
 /* fog, then any cloud in front of a surface t metres away */
 vec3 atmos(vec3 col, vec3 rd, float t, int steps, float jit) {
     float T = fogTrans(rd, t);
@@ -838,7 +853,7 @@ void main() {
 static const char *FS_WATER = GLSL(
 in vec3 vRel;
 out vec4 oCol;
-uniform sampler2D uSSR;        /* reflections off flat water, half res (FS_SSR) */
+uniform sampler2D uSSR;        /* reflections off flat water, quarter res (FS_SSR) */
 uniform vec2 uSceneSize;
 float wav(vec2 w, float s, vec2 v) { return texture(uNoise2, w / s + v * uTime / s).b; }
 void main() {
@@ -908,6 +923,7 @@ uniform mat4 uVP; uniform float uTreeR; uniform float uTreeNear; uniform float u
 out float vLod;
 out vec3 vRel; out vec3 vN; out float vAO; out float vFade; out float vTint; out float vShadow; out float vType;
 out vec3 vObj;     /* metres in the tree's own frame, offset per tree: where its leaf clumps are */
+out vec4 vAtm;     /* fog, mist and haze per vertex: col * a + rgb */
 void main() {
     float c = cos(iB.z), s = sin(iB.z);
     vec3 lp = vec3(aPos.x * c - aPos.z * s, aPos.y, aPos.x * s + aPos.z * c);
@@ -928,13 +944,16 @@ void main() {
     vFade = 1.0 - smoothstep(uTreeR * 0.72, uTreeR, length(iA.xz));   /* FADE0 */
     vLod = smoothstep(uTreeNear - uTreeBand, uTreeNear + uTreeBand, length(iA.xz));
     vShadow = terrShadow(iA.xyz).r * cloudShadow(iA.xyz);
+    vec3 d = vRel - vec3(0.0, uCamY, 0.0);
+    float dl = length(d);
+    vAtm = atmosParts(d / dl, dl, 4, 0.5);
     gl_Position = uVP * vec4(vRel, 1.0);
 }
 );
 
 static const char *FS_TREE = GLSL(
 in vec3 vRel; in vec3 vN; in float vAO; in float vFade; in float vTint; in float vShadow; in float vType;
-in float vLod; in vec3 vObj;
+in float vLod; in vec3 vObj; in vec4 vAtm;
 uniform int uFar;                /* drawing the far mesh: complementary dither across the LOD band */
 out vec4 oCol;
 void main() {
@@ -972,7 +991,7 @@ void main() {
     float back = pow(max(dot(rd, uSunDir), 0.0), 4.0) * (0.35 + 0.9 * rim * rim) * (trunk ? 0.0 : 1.0);
     vec3 light = uSunCol * (diff + back * vec3(0.8, 1.3, 0.5)) * vShadow * mix(0.55, 1.0, ao) +
                  mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * ao * mix(0.6, 1.0, cl);
-    oCol = vec4(atmos(base * light, rd, dist, 6, ign(gl_FragCoord.xy)), 1.0);
+    oCol = vec4(base * light * vAtm.a + vAtm.rgb, 1.0);
 }
 );
 
@@ -983,7 +1002,7 @@ layout(location = 0) in vec4 aP;
 layout(location = 1) in vec4 iA;   /* rel x, y, z, heading (radians, 0 = -z) */
 layout(location = 2) in vec4 iB;   /* flap angle, roll, scale, pitch */
 uniform mat4 uVP;
-out vec3 vRel; out vec3 vN;
+out vec3 vRel; out vec3 vN; out vec4 vAtm;
 void main() {
     vec3 p = aP.xyz;
     float a = iB.x, s = sign(p.x), ax = abs(p.x);
@@ -1006,12 +1025,15 @@ void main() {
     n = vec3(n.x * ch - n.z * sh, n.y, -n.x * sh - n.z * ch);
     vRel = iA.xyz + p * iB.z;
     vN = n;
+    vec3 d = vRel - vec3(0.0, uCamY, 0.0);
+    float dl = length(d);
+    vAtm = atmosParts(d / dl, dl, 4, 0.5);
     gl_Position = uVP * vec4(vRel, 1.0);
 }
 );
 
 static const char *FS_BIRD = GLSL(
-in vec3 vRel; in vec3 vN;
+in vec3 vRel; in vec3 vN; in vec4 vAtm;
 out vec4 oCol;
 void main() {
     vec3 cam = vec3(0.0, uCamY, 0.0);
@@ -1022,7 +1044,7 @@ void main() {
     vec3 base = vec3(0.05, 0.045, 0.04);
     float diff = max(dot(n, uSunDir), 0.0);
     vec3 light = uSunCol * diff * cloudShadow(vRel) + mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5);
-    oCol = vec4(atmos(base * light, rd, dist, 4, ign(gl_FragCoord.xy)), 1.0);
+    oCol = vec4(base * light * vAtm.a + vAtm.rgb, 1.0);
 }
 );
 
@@ -1139,8 +1161,8 @@ void main() {
 }
 );
 
-/* Reflections of the scene in the water, traced for a flat surface at half
- * res: each pixel's ray meets the water plane, and if water shows there the
+/* Reflections of the scene in the water, traced for a flat surface at
+ * quarter res: each pixel's ray meets the water plane, and if water shows there the
  * reflected ray is marched through the scene's depth. */
 static const char *FS_SSR = GLSL(
 in vec2 vUV;
@@ -1244,7 +1266,7 @@ static GLuint vao_empty, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3
 /* offscreen targets */
 static GLuint fbo_scene, tex_scene, tex_depth, fbo_final, tex_final;
 static GLuint fbo_refl, tex_refl, tex_refl_d;
-static GLuint fbo_ssr, tex_ssr;                /* the water's reflections, half res */              /* half res copy of the scene for the water to reflect */
+static GLuint fbo_ssr, tex_ssr;                /* the water's reflections, quarter res */              /* half res copy of the scene for the water to reflect */
 static GLuint fbo_shaft[2], tex_shaft[2];     /* light shafts at quarter res: the mask, then its radial blur */
 static int shaft_w, shaft_h;
 static GLuint fbo_cloud[2], tex_cloud[2];     /* sky clouds at half res, this frame's and last's (ping-pong) */
@@ -1302,7 +1324,7 @@ static void resize_scene(int w, int h) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex_refl_d, 0);
     static const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
     glDrawBuffers(2, bufs);
-    tex_ssr = mk_tex2d(GL_RGBA16F, (w + 1) / 2, (h + 1) / 2, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+    tex_ssr = mk_tex2d(GL_RGBA16F, (w + 3) / 4, (h + 3) / 4, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
     fbo_ssr = mk_fbo(tex_ssr);
     shaft_w = (w + 3) / 4; shaft_h = (h + 3) / 4;
     for (int i = 0; i < 2; i++) {
@@ -1757,6 +1779,27 @@ static void setup_matrices(void) {
 static float sim_time;
 
 static float pix_ang;                     /* radians per scene pixel */
+static float mist_top0;                   /* the shaders' mistTop() under the camera */
+/* mistTop(): the ground's average over ~2 km (the coarse map's mip 6,
+ * filtered bilinearly like the GPU does) less 80 m */
+static float mip6(int32_t kx, int32_t kz) {
+    const HMap *m = &hm[1];
+    double sum = 0;
+    for (int j = 0; j < 64; j += 4)
+        for (int i = 0; i < 64; i += 4)
+            sum += m->data[2 * ((size_t)((kz * 64 + j) & (m->n - 1)) * m->n + ((kx * 64 + i) & (m->n - 1)))];
+    return (float)(sum / 256);
+}
+static void mist_update(void) {
+    double sp = hm[1].unit * BASE;
+    /* the shader samples texel coordinate x / sp + 0.5; mip-6 texel centres sit at (k + 0.5) * 64 */
+    double fx = (fl.x / sp + 0.5) / 64 - 0.5, fz = (fl.z / sp + 0.5) / 64 - 0.5;
+    int32_t kx = (int32_t)floor(fx), kz = (int32_t)floor(fz);
+    float tx = (float)(fx - kx), tz = (float)(fz - kz);
+    float a = mip6(kx, kz), b = mip6(kx + 1, kz), c = mip6(kx, kz + 1), d = mip6(kx + 1, kz + 1);
+    float h = (a + (b - a) * tx) * (1 - tz) + (c + (d - c) * tx) * tz;
+    mist_top0 = fmaxf(h - 80, 5);
+}
 static void set_common(GLuint p) {
     glUseProgram(p);
     glUniform3fv(UL(p, "uSunDir"), 1, pal.sun_dir);
@@ -1770,6 +1813,7 @@ static void set_common(GLuint p) {
     glUniform1f(UL(p, "uTime"), fmodf(sim_time, 4096.0f));
     glUniform1f(UL(p, "uFogA"), pal.fog_a);
     glUniform1f(UL(p, "uMist"), pal.mist);
+    glUniform1f(UL(p, "uMistTop0"), mist_top0);
     glUniform1f(UL(p, "uFogB"), pal.fog_b);
     glUniform1f(UL(p, "uHaze"), pal.haze);
     glUniform1f(UL(p, "uFogFar"), FOG_FAR);
@@ -1868,6 +1912,22 @@ static void draw_trees(void) {
         }
     }
     glDisable(GL_CULL_FACE);
+}
+
+/* any water in the coarse map ahead (a cheap scan): else skip the water
+ * and its reflection passes altogether */
+static int water_ahead(void) {
+    const HMap *m = &hm[1];
+    double sp = m->unit * BASE;
+    float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw);
+    for (int j = -48; j <= 48; j++)
+        for (int i = -48; i <= 48; i++) {
+            float dx = i * 4 * (float)sp, dz = j * 4 * (float)sp;   /* every 4th texel: 128 m */
+            if (dx * fx + dz * fz < -600) continue;                    /* well behind */
+            int32_t tx = (int32_t)floor((fl.x + dx) / sp), tz = (int32_t)floor((fl.z + dz) / sp);
+            if (m->data[2 * ((size_t)(tz & (m->n - 1)) * m->n + (tx & (m->n - 1)))] < 0.5f) return 1;
+        }
+    return 0;
 }
 
 static void draw_water(void) {
@@ -2230,6 +2290,7 @@ static void render(GLuint target) {
     hm_update(&hm[1], fl.x, fl.z);
     if (opt_trees) trees_update();
     birds_update();
+    mist_update();
     prof_mark(PR_BAKE);
     bake_step();
 
@@ -2268,6 +2329,7 @@ static void render(GLuint target) {
     glDepthMask(GL_TRUE);
 
     prof_mark(PR_WATER);
+    if (water_ahead()) {
     /* what the water reflects: the scene so far, at half res */
     glDisable(GL_DEPTH_TEST);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_refl);
@@ -2283,6 +2345,7 @@ static void render(GLuint target) {
     glActiveTexture(GL_TEXTURE12);
     glBindTexture(GL_TEXTURE_2D, tex_refl_d);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_ssr);
+    glViewport(0, 0, (scene_w + 3) / 4, (scene_h + 3) / 4);
     set_common(p_ssr);
     glUniform4fv(UL(p_ssr, "uViewTan"), 1, view_tan);
     glUniformMatrix3fv(UL(p_ssr, "uCamRot"), 1, GL_FALSE, rot3);
@@ -2294,6 +2357,7 @@ static void render(GLuint target) {
     glViewport(0, 0, scene_w, scene_h);
     glEnable(GL_DEPTH_TEST);
     draw_water();
+    }
 
     glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     glDepthFunc(GL_LESS);
