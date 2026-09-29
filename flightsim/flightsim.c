@@ -1,7 +1,7 @@
 /*
  * flightsim — a flight-sim screensaver.
  *
- * Endless procedural mountains streamed into a geometry clipmap (~14 km of
+ * Endless procedural mountains streamed into GPU-tessellated terrain (~14 km of
  * view), lit per pixel with baked terrain shadows and ambient occlusion,
  * height fog that pools in the valleys, raymarched cumulus that shade the
  * ground, reflective water, instanced forests, a painted sky with stars at
@@ -284,7 +284,7 @@ typedef struct {
     float *data;
     GLuint tex;
 } HMap;
-static HMap hm[2] = {{512, 1, 0, 0, 0, NULL, 0}, {1024, 4, 0, 0, 0, NULL, 0}};
+static HMap hm[2] = {{1024, 1, 0, 0, 0, NULL, 0}, {1024, 4, 0, 0, 0, NULL, 0}};
 
 static void hm_texel(HMap *m, int32_t i, int32_t j) {
     double x = (double)i * m->unit * BASE, z = (double)j * m->unit * BASE;
@@ -306,6 +306,7 @@ static void hm_update(HMap *m, double cx, double cz) {
         m->ox = nx; m->oz = nz; m->valid = 1;
         parallel_for(n, hm_fill_row, m);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, n, n, GL_RG, GL_FLOAT, m->data);
+        glGenerateMipmap(GL_TEXTURE_2D);
         return;
     }
     glPixelStorei(GL_UNPACK_ROW_LENGTH, n);
@@ -322,6 +323,8 @@ static void hm_update(HMap *m, double cx, double cz) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, j & mask, n, 1, GL_RG, GL_FLOAT, m->data + 2 * (size_t)(j & mask) * n);
     }
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    /* the terrain samples mips (a triangle's worth of ground), so keep them current */
+    if (nx != m->ox || nz != m->oz) glGenerateMipmap(GL_TEXTURE_2D);
     m->ox = nx; m->oz = nz;
 }
 
@@ -353,20 +356,29 @@ static GLuint compile(GLenum type, const char *const *src, int n, const char *na
     if (!ok) {
         char log[8192];
         glGetShaderInfoLog(s, sizeof log, NULL, log);
-        fprintf(stderr, "flightsim: %s %s shader:\n%s\n", name, type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
+        fprintf(stderr, "flightsim: %s %s shader:\n%s\n", name,
+                type == GL_VERTEX_SHADER ? "vertex" : type == GL_FRAGMENT_SHADER ? "fragment" :
+                type == GL_TESS_CONTROL_SHADER ? "tess control" : "tess evaluation", log);
         exit(1);
     }
     return s;
 }
 
-static const char *GLSL_HEAD = "#version 330 core\n";
+static const char *GLSL_HEAD = "#version 450 core\n";
 static const char *GLSL_COMMON;
 
-static GLuint program(const char *name, const char *vs, const char *fs) {
-    const char *v[3] = {GLSL_HEAD, GLSL_COMMON, vs}, *f[3] = {GLSL_HEAD, GLSL_COMMON, fs};
+/* tcs/tes: optional tessellation stages (both or neither) */
+/* fs_pre: extra fragment-shader source ahead of the common code (variants) */
+static GLuint program_full(const char *name, const char *vs, const char *tcs, const char *tes, const char *fs, const char *fs_pre) {
+    const char *v[3] = {GLSL_HEAD, GLSL_COMMON, vs}, *f[4] = {GLSL_HEAD, fs_pre, GLSL_COMMON, fs};
     GLuint p = glCreateProgram();
     glAttachShader(p, compile(GL_VERTEX_SHADER, v, 3, name));
-    glAttachShader(p, compile(GL_FRAGMENT_SHADER, f, 3, name));
+    if (tcs) {
+        const char *c[3] = {GLSL_HEAD, GLSL_COMMON, tcs}, *e[3] = {GLSL_HEAD, GLSL_COMMON, tes};
+        glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, c, 3, name));
+        glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, e, 3, name));
+    }
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, f, 4, name));
     glLinkProgram(p);
     GLint ok;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -383,8 +395,16 @@ static GLuint program(const char *name, const char *vs, const char *fs) {
         GLint l = glGetUniformLocation(p, units[i]);
         if (l >= 0) glUniform1i(l, i);
     }
+    GLint l = glGetUniformLocation(p, "uHist");                 /* unit 7 is the upload scratch unit */
+    if (l < 0) l = glGetUniformLocation(p, "uCloudTex");
+    if (l >= 0) glUniform1i(l, 8);
     return p;
 }
+
+static GLuint program_tess(const char *name, const char *vs, const char *tcs, const char *tes, const char *fs) {
+    return program_full(name, vs, tcs, tes, fs, "");
+}
+static GLuint program(const char *name, const char *vs, const char *fs) { return program_tess(name, vs, NULL, NULL, fs); }
 
 #define UL(p, n) glGetUniformLocation(p, n)
 
@@ -400,12 +420,15 @@ uniform float uCloudBase; uniform float uCloudThick; uniform float uCloudCover; 
 uniform sampler2D uH0; uniform sampler2D uH1; uniform sampler2D uShadow;
 uniform sampler2D uNoise2; uniform sampler3D uNoise3;
 uniform vec2 uT0Cam; uniform vec2 uT1Cam;
+uniform float uPixAng;               /* radians per scene pixel */
 
 float hash12(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * .1031);
     p3 += dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
 }
+/* interleaved gradient noise: a jitter that tiles smoothly, unlike white noise */
+float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float hash13(vec3 p3) {
     p3 = fract(p3 * .1031);
     p3 += dot(p3, p3.zyx + 31.32);
@@ -438,6 +461,9 @@ vec3 stars(vec3 rd) {
            smoothstep(0.3, 0.0, length(f)) * b * b * 2.5 * tw * uStars * smoothstep(0.0, 0.2, rd.y);
 }
 
+/* weight of the fine heightmap (+-4 km around the camera) over the coarse one */
+float fineW(float cheb) { return 1.0 - smoothstep(2800.0, 3600.0, cheb); }
+
 /* transmittance of the height fog + haze over t metres along rd */
 float fogTrans(vec3 rd, float t) {
     float k = rd.y * uFogB;
@@ -447,20 +473,32 @@ float fogTrans(vec3 rd, float t) {
 vec3 fogColor(vec3 rd) { return skyBase(rd); }
 
 /* cumulus: a 2D coverage field sets each column's height, 3D billow noise erodes it */
-float cloudCov(vec2 xz) {
+/* fp: the sample's footprint in metres. The raymarch picks mips itself: the
+ * hardware's choice is garbage inside a loop that pixels leave at different
+ * steps, and that shows as speckle. */
+float cloudCovLod(vec2 xz, float fp) {
     vec2 w = uCloudMod + xz;
-    float n = texture(uNoise2, w / 8192.0).r * 0.6 + texture(uNoise2, w / 2048.0).g * 0.4;
+    /* no finer than ~128 m: this 2D field is extruded straight up into each
+     * cloud's column, so any finer detail reads as vertical streaks */
+    float n = textureLod(uNoise2, w / 8192.0, max(log2(fp / 32.0), 2.0)).r * 0.6 +
+              textureLod(uNoise2, w / 2048.0, max(log2(fp / 8.0), 4.0)).g * 0.4;
     return smoothstep(1.0 - uCloudCover, 1.0 - uCloudCover + 0.28, n);
 }
+float cloudCov(vec2 xz) { return cloudCovLod(xz, 1.0); }
 float cloudShadow(vec3 p) {
     if (uCloudsOn < 0.5) return 1.0;
     float y = uCloudBase + uCloudThick * 0.2;
     vec2 q = p.xz + uSunDir.xz / max(uSunDir.y, 0.06) * (y - p.y);
-    return 1.0 - 0.78 * smoothstep(0.02, 0.3, cloudCov(q));
+    /* soft-edged, like the penumbra of a thick cloud: a steep slope maps a few
+     * metres of height onto a long run of the cloud field (up to 1/sin of the
+     * sun's elevation), so any fine detail here comes out as stripes */
+    return 1.0 - 0.75 * smoothstep(0.03, 0.45, cloudCovLod(q, 400.0));
 }
 float hg(float mu, float g) { return (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5); }
 
+float gCloudT;                   /* clouds(): opacity-weighted distance of what it hit */
 vec4 clouds(vec3 rd, float tmax, int steps, float jit) {
+    gCloudT = 4000.0;
     if (uCloudsOn < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
     float top = uCloudBase + uCloudThick, t0, t1;
     if (abs(rd.y) < 1e-4) {
@@ -472,20 +510,25 @@ vec4 clouds(vec3 rd, float tmax, int steps, float jit) {
     }
     t1 = min(t1, uFogFar);
     if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
-    float dt = (t1 - t0) / float(steps), T = 1.0;
+    float dt = (t1 - t0) / float(steps), T = 1.0, tw = 0.0, wsum = 0.0;
+    gCloudT = 0.5 * (t0 + t1);
     vec3 L = vec3(0.0), fc = fogColor(rd);
     float mu = dot(rd, uSunDir);
     float phase = mix(hg(mu, -0.15), hg(mu, 0.7), 0.3);
     for (int i = 0; i < steps; i++) {
         float t = t0 + (float(i) + jit) * dt;
         vec3 p = vec3(0.0, uCamY, 0.0) + rd * t;
-        float cov = cloudCov(p.xz);
+        /* footprint: a pixel's width out here (the jitter, averaged over
+         * frames, takes care of the gaps between steps) */
+        float fp = t * uPixAng;
+        float cov = cloudCovLod(p.xz, fp);
         if (cov <= 0.0) continue;
         float h = (p.y - uCloudBase) / uCloudThick;
         float d = min(cov * 1.1 - h * h * 1.3 - 0.05, h * 2.0);
         if (d <= -0.3) continue;
         vec3 q = vec3(uCloudMod.x + p.x, p.y * 1.6 - uTime * 1.5, uCloudMod.y + p.z) / 1024.0;
-        float bil = texture(uNoise3, q).r * 0.65 + texture(uNoise3, q * 3.7).r * 0.35;
+        float lod = log2(fp / 16.0);
+        float bil = textureLod(uNoise3, q, lod).r * 0.65 + textureLod(uNoise3, q * 3.7, lod + 1.89).r * 0.35;
         d -= (1.0 - bil) * (0.30 + 0.25 * (1.0 - cov));
         float dens = clamp(d * 3.0, 0.0, 1.0);
         if (dens <= 0.0) continue;
@@ -499,9 +542,11 @@ vec4 clouds(vec3 rd, float tmax, int steps, float jit) {
         float a = 1.0 - exp(-dens * uCloudDens * dt);
         float fT = fogTrans(rd, t);
         L += T * a * (lum * fT + fc * (1.0 - fT));
+        tw += T * a * t; wsum += T * a;
         T *= 1.0 - a;
         if (T < 0.02) break;
     }
+    if (wsum > 1e-3) gCloudT = tw / wsum;
     return vec4(L, T);
 }
 
@@ -529,52 +574,130 @@ void main() {
 }
 );
 
+/* Sky clouds, accumulated over frames: each frame marches with a fresh jitter
+ * and blends into last frame's result, reprojected to where the cloud it hit
+ * was then (camera turn and travel both), so ~56 steps look like hundreds. */
+static const char *FS_CLOUD = GLSL(
+in vec2 vUV;
+uniform vec4 uViewTan; uniform mat3 uCamRot;
+uniform vec4 uPrevTan; uniform mat3 uPrevRot; uniform vec3 uPrevCam;   /* uPrevCam: last camera, relative to this one */
+uniform sampler2D uHist; uniform float uHistW; uniform float uFrame;
+out vec4 oCol;
+void main() {
+    vec3 rd = normalize(uCamRot * vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0));
+    vec4 c = clouds(rd, 1e9, 32, fract(ign(gl_FragCoord.xy) + uFrame * 0.618034));
+    vec3 v = transpose(uPrevRot) * (rd * gCloudT - uPrevCam);
+    if (uHistW > 0.0 && v.z < -1.0) {
+        vec2 uv = (v.xy / -v.z - uPrevTan.xy) / uPrevTan.zw;
+        if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0))))
+            c = mix(c, texture(uHist, uv), uHistW);
+    }
+    oCol = c;
+}
+);
+
 static const char *FS_SKY = GLSL(
 in vec2 vUV;
 uniform vec4 uViewTan; uniform mat3 uCamRot;
+uniform sampler2D uCloudTex;
 out vec4 oCol;
 void main() {
     vec3 rd = normalize(uCamRot * vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0));
     vec3 col = skyBase(rd) + sunDisc(rd) + stars(rd);
-    vec4 c = clouds(rd, 1e9, 56, hash12(gl_FragCoord.xy));
+    vec4 c = uCloudsOn > 0.5 ? texture(uCloudTex, vUV) : vec4(0.0, 0.0, 0.0, 1.0);
     oCol = vec4(col * c.a + c.rgb, 1.0);
 }
 );
 
+/* Terrain: a world-anchored grid of PATCH-metre patches, each tessellated on
+ * the GPU so its triangles are about TESS_PX pixels wide wherever they are.
+ * Heights come from the heightmap mip that matches a triangle's size, so the
+ * ground only ever changes by sub-triangle detail as it comes closer, rather
+ * than whole ridges growing in as fixed LOD rings pass over them. */
 static const char *VS_TERRAIN = GLSL(
-layout(location = 0) in ivec2 aV;
-layout(location = 1) in ivec2 aQ;
-uniform mat4 uVP;
-uniform ivec2 uOrg; uniform int uMul; uniform int uTexSel; uniform int uNQ; uniform ivec4 uHole; uniform float uMorph;
+uniform ivec2 uPatch0; uniform int uPatchCells;
 uniform ivec2 uCamCell; uniform vec2 uCamFrac;
-out vec3 vRel;
-float hAt(ivec2 b) {
-    if (uTexSel == 0) return texelFetch(uH0, b & 511, 0).r;
-    return texelFetch(uH1, (b >> 2) & 1023, 0).r;
+/* patches nearest the camera first, so early depth rejects what they hide */
+layout(std430, binding = 0) readonly buffer PatchOrder { ivec2 order[]; };
+out vec2 vXZ;
+void main() {
+    ivec2 pi = uPatch0 + order[gl_InstanceID] + ivec2(gl_VertexID & 1, gl_VertexID >> 1);
+    vXZ = vec2(pi * uPatchCells - uCamCell) * 8.0 - uCamFrac;
+}
+);
+
+static const char *TCS_TERRAIN = GLSL(
+layout(vertices = 4) out;
+in vec2 vXZ[]; out vec2 tXZ[];
+uniform mat4 uVP; uniform float uTessK;        /* uTessK: 1 / (radians per triangle) */
+float hLod(vec2 xz, float lod) { return max(textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, lod).r, 0.0); }
+/* how far the ground strays from a straight line between a and b (m) */
+float bumpiness(vec2 a, vec2 b) {
+    float ha = hLod(a, 1.0), hb = hLod(b, 1.0), dev = 0.0;
+    for (int i = 1; i < 8; i++) {
+        float f = float(i) / 8.0;
+        dev = max(dev, abs(hLod(mix(a, b, f), 1.0) - mix(ha, hb, f)));
+    }
+    return dev;
+}
+/* screen-sized triangles, fewer where the ground is smooth enough that
+ * coarser ones lose nothing. Depends on the edge's two ends alone, so
+ * neighbours agree and never crack. */
+float level(vec2 a, vec2 b, float bump) {
+    vec2 m = 0.5 * (a + b);
+    float d = length(vec3(m.x, hLod(m, 3.0) - uCamY, m.y));
+    return clamp(length(b - a) * uTessK / max(d, 1.0) * clamp(bump / 60.0, 0.25, 1.0), 1.0, 64.0);
+}
+float edgeLevel(vec2 a, vec2 b) { return level(a, b, bumpiness(a, b)); }
+bool outside(vec4 c[8], int axis, float sgn) {
+    for (int i = 0; i < 8; i++) if (sgn * c[i][axis] < c[i].w) return false;
+    return true;
 }
 void main() {
-    if (aQ.x >= uHole.x && aQ.x < uHole.z && aQ.y >= uHole.y && aQ.y < uHole.w) {
-        vRel = vec3(0.0);
-        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    tXZ[gl_InvocationID] = vXZ[gl_InvocationID];
+    if (gl_InvocationID != 0) return;
+    /* cull: beyond the fog, or wholly off one side of the view */
+    vec2 lo = min(min(vXZ[0], vXZ[1]), min(vXZ[2], vXZ[3])), hi = max(max(vXZ[0], vXZ[1]), max(vXZ[2], vXZ[3]));
+    vec2 nearest = clamp(vec2(0.0), lo, hi);
+    bool cull = length(nearest) > uFogFar;
+    if (!cull) {
+        vec4 c[8];
+        for (int i = 0; i < 8; i++) c[i] = uVP * vec4(vXZ[i & 3].x, (i < 4 ? -120.0 : 2400.0), vXZ[i & 3].y, 1.0);
+        cull = outside(c, 0, 1.0) || outside(c, 0, -1.0) || outside(c, 1, 1.0) || outside(c, 1, -1.0);
+    }
+    if (cull) {
+        gl_TessLevelOuter[0] = gl_TessLevelOuter[1] = gl_TessLevelOuter[2] = gl_TessLevelOuter[3] = 0.0;
+        gl_TessLevelInner[0] = gl_TessLevelInner[1] = 0.0;
         return;
     }
-    ivec2 L = uOrg + aV, b = L * uMul;
-    float h = hAt(b);
-    /* morph toward the next level's lattice at the border, so the rings meet without cracks */
-    ivec2 c2 = abs(aV * 2 - uNQ);
-    float M = float(uNQ) / 8.0, d = float(max(c2.x, c2.y)) * 0.5;
-    float t = uMorph * clamp((d - (float(uNQ) * 0.5 - M)) / M, 0.0, 1.0);
-    if (t > 0.0) {
-        ivec2 o = L & 1;
-        float hc = h;
-        if (o.x == 1 && o.y == 1)
-            hc = 0.25 * (hAt((L + ivec2(-1, -1)) * uMul) + hAt((L + ivec2(1, -1)) * uMul) +
-                         hAt((L + ivec2(-1, 1)) * uMul) + hAt((L + ivec2(1, 1)) * uMul));
-        else if (o.x == 1) hc = 0.5 * (hAt((L - ivec2(1, 0)) * uMul) + hAt((L + ivec2(1, 0)) * uMul));
-        else if (o.y == 1) hc = 0.5 * (hAt((L - ivec2(0, 1)) * uMul) + hAt((L + ivec2(0, 1)) * uMul));
-        h = mix(h, hc, t);
-    }
-    vec2 xz = vec2(b - uCamCell) * 8.0 - uCamFrac;
+    /* corners: 0 (0,0), 1 (1,0), 2 (0,1), 3 (1,1) */
+    gl_TessLevelOuter[0] = edgeLevel(vXZ[0], vXZ[2]);
+    gl_TessLevelOuter[1] = edgeLevel(vXZ[0], vXZ[1]);
+    gl_TessLevelOuter[2] = edgeLevel(vXZ[1], vXZ[3]);
+    gl_TessLevelOuter[3] = edgeLevel(vXZ[2], vXZ[3]);
+    /* inside: its own bumpiness (the midlines and diagonals); only the
+     * edges have to match the neighbours */
+    vec2 m01 = 0.5 * (vXZ[0] + vXZ[1]), m23 = 0.5 * (vXZ[2] + vXZ[3]), m02 = 0.5 * (vXZ[0] + vXZ[2]), m13 = 0.5 * (vXZ[1] + vXZ[3]);
+    float bi = max(max(bumpiness(m01, m23), bumpiness(m02, m13)), max(bumpiness(vXZ[0], vXZ[3]), bumpiness(vXZ[1], vXZ[2])));
+    gl_TessLevelInner[0] = max(level(m02, m13, bi), max(gl_TessLevelOuter[1], gl_TessLevelOuter[3]) * 0.5);
+    gl_TessLevelInner[1] = max(level(m01, m23, bi), max(gl_TessLevelOuter[0], gl_TessLevelOuter[2]) * 0.5);
+}
+);
+
+static const char *TES_TERRAIN = GLSL(
+layout(quads, fractional_even_spacing, ccw) in;
+in vec2 tXZ[];
+uniform mat4 uVP; uniform float uTessK;
+out vec3 vRel;
+void main() {
+    vec2 u = gl_TessCoord.xy;
+    vec2 xz = mix(mix(tXZ[0], tXZ[1], u.x), mix(tXZ[2], tXZ[3], u.x), u.y);
+    /* the mip whose texels are about a triangle wide here (a function of the
+     * position only, so shared edges get the same heights) */
+    float lod = log2(max(length(xz) / uTessK, 8.0) / 8.0);
+    float h = textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, max(lod - 2.0, 0.0)).r;
+    float w0 = fineW(max(abs(xz.x), abs(xz.y)));
+    if (w0 > 0.0) h = mix(h, textureLod(uH0, (uT0Cam + xz / 8.0 + 0.5) / 1024.0, lod).r, w0);
     vRel = vec3(xz.x, h, xz.y);
     gl_Position = uVP * vec4(vRel, 1.0);
 }
@@ -597,14 +720,14 @@ void main() {
     vec3 rd = (p - cam) / dist;
     float cheb = max(abs(p.x), abs(p.z));
     float f1, f0, forest;
-    vec3 n = hmNormal(uH1, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0, 1.0 / 1024.0, 32.0, f1);
-    forest = f1;
-    float w0 = 1.0 - smoothstep(1400.0, 1850.0, cheb);
+    float w0 = fineW(cheb);
+    vec3 n = vec3(0.0, 1.0, 0.0);
+    if (w0 < 1.0) n = hmNormal(uH1, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0, 1.0 / 1024.0, 32.0, f1);
     if (w0 > 0.0) {
-        vec3 n0 = hmNormal(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 512.0, 1.0 / 512.0, 8.0, f0);
-        n = normalize(mix(n, n0, w0));
-        forest = mix(f1, f0, w0);
-    }
+        vec3 n0 = hmNormal(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 1024.0, 1.0 / 1024.0, 8.0, f0);
+        n = w0 < 1.0 ? normalize(mix(n, n0, w0)) : n0;
+        forest = w0 < 1.0 ? mix(f1, f0, w0) : f0;
+    } else forest = f1;
     vec2 w = uWorldMod + p.xz;
     float n1 = nz(w, 1024.0, 0), n2 = nz(w, 256.0, 1), n3 = nz(w, 32.0, 2);
 
@@ -646,7 +769,7 @@ void main() {
     vec3 lit = col * (uSunCol * diff * sh + amb);
     vec3 H = normalize(uSunDir - rd);
     lit += uSunCol * snowAmt * sh * pow(max(dot(n, H), 0.0), 40.0) * 0.25;
-    oCol = vec4(atmos(lit, rd, dist, 10, hash12(gl_FragCoord.xy)), 1.0);
+    oCol = vec4(atmos(lit, rd, dist, 10, ign(gl_FragCoord.xy)), 1.0);
 }
 );
 
@@ -668,8 +791,8 @@ void main() {
     vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
     float cheb = max(abs(p.x), abs(p.z));
     float hb = texture(uH1, (uT1Cam + p.xz / 32.0 + 0.5) / 1024.0).r;
-    float w0 = 1.0 - smoothstep(1400.0, 1850.0, cheb);
-    if (w0 > 0.0) hb = mix(hb, texture(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 512.0).r, w0);
+    float w0 = fineW(cheb);
+    if (w0 > 0.0) hb = mix(hb, texture(uH0, (uT0Cam + p.xz / 8.0 + 0.5) / 1024.0).r, w0);
     float depth = -hb;
     if (depth <= 0.0) discard;
     float dist = length(p - cam);
@@ -722,17 +845,29 @@ layout(location = 1) in vec3 aNrm;
 layout(location = 2) in float aAO;
 layout(location = 3) in vec4 iA;   /* rel x, y, rel z, height */
 layout(location = 4) in vec4 iB;   /* width, tint, rotation, type */
-uniform mat4 uVP; uniform float uTreeR;
+uniform mat4 uVP; uniform float uTreeR; uniform float uTreeNear; uniform float uTreeBand;
+out float vLod;
 out vec3 vRel; out vec3 vN; out float vAO; out float vFade; out float vTint; out float vShadow; out float vType;
+out vec3 vObj;     /* metres in the tree's own frame, offset per tree: where its leaf clumps are */
 void main() {
     float c = cos(iB.z), s = sin(iB.z);
     vec3 lp = vec3(aPos.x * c - aPos.z * s, aPos.y, aPos.x * s + aPos.z * c);
     vec3 ln = vec3(aNrm.x * c - aNrm.z * s, aNrm.y, aNrm.x * s + aNrm.z * c);
+    /* bend the foliage normals toward "out from the crown's middle", so the
+     * crown lights as one soft round mass instead of facets */
+    if (aAO >= 0.0) {
+        vec3 ctr = iB.w < 0.5 ? vec3(0.0, max(aPos.y - 0.25, 0.3), 0.0) : vec3(0.0, 0.62, 0.0);
+        vec3 r = aPos - ctr;
+        vec3 rn = normalize(vec3(r.x * c - r.z * s, r.y, r.x * s + r.z * c));
+        ln = normalize(mix(ln, rn, 0.45));
+    }
     float sway = sin(uTime * 1.1 + iA.x * 0.05 + iA.z * 0.07) * 0.015 * aPos.y * aPos.y;
     vRel = vec3(iA.x + (lp.x + sway) * iB.x, iA.y + lp.y * iA.w, iA.z + lp.z * iB.x);
     vN = normalize(vec3(ln.x / iB.x, ln.y / iA.w, ln.z / iB.x));
+    vObj = vec3(aPos.x * iB.x, aPos.y * iA.w, aPos.z * iB.x) + iB.y * 97.0 + iB.z * 13.0;
     vAO = aAO; vTint = iB.y; vType = iB.w;
-    vFade = 1.0 - smoothstep(uTreeR * 0.72, uTreeR, length(iA.xz));
+    vFade = 1.0 - smoothstep(uTreeR * 0.72, uTreeR, length(iA.xz));   /* FADE0 */
+    vLod = smoothstep(uTreeNear - uTreeBand, uTreeNear + uTreeBand, length(iA.xz));
     vShadow = terrShadow(iA.xyz).r * cloudShadow(iA.xyz);
     gl_Position = uVP * vec4(vRel, 1.0);
 }
@@ -740,21 +875,45 @@ void main() {
 
 static const char *FS_TREE = GLSL(
 in vec3 vRel; in vec3 vN; in float vAO; in float vFade; in float vTint; in float vShadow; in float vType;
+in float vLod; in vec3 vObj;
+uniform int uFar;                /* drawing the far mesh: complementary dither across the LOD band */
 out vec4 oCol;
 void main() {
-    if (hash12(gl_FragCoord.xy) > vFade) discard;
+    /* leaf clumps: billowy 3D noise in the tree's frame (sampled before any
+     * discard, so the mip choice is sound); pines get finer, flatter tufts */
+    vec3 q = (vType < 0.5 ? vObj * vec3(0.55, 0.9, 0.55) : vObj * 0.42) / 5.0;
+    float clump = texture(uNoise3, q).r;
+    /* the same a little toward the sun: a clump is lit on its sunny side */
+    float clumpL = texture(uNoise3, q + uSunDir * 0.04).r;
+    if (kDither) {
+        if (hash12(gl_FragCoord.xy) > vFade) discard;
+        if ((hash12(gl_FragCoord.xy + 17.0) < vLod) != (uFar == 1)) discard;
+    }
     vec3 n = normalize(vN), cam = vec3(0.0, uCamY, 0.0);
     float dist = length(vRel - cam);
     vec3 rd = (vRel - cam) / dist;
     vec3 base;
-    if (vAO < 0.0) base = vec3(0.07, 0.045, 0.03);
-    else if (vType < 0.5) base = mix(vec3(0.016, 0.045, 0.022), vec3(0.03, 0.06, 0.025), vTint);
-    else base = mix(vec3(0.04, 0.10, 0.022), vec3(0.11, 0.12, 0.025), vTint * vTint);
+    bool trunk = vAO < 0.0;
+    if (trunk) base = vec3(0.07, 0.045, 0.03);
+    else if (vType < 0.5) base = mix(vec3(0.022, 0.058, 0.032), vec3(0.04, 0.078, 0.04), vTint);
+    else {
+        base = mix(vec3(0.045, 0.105, 0.028), vec3(0.085, 0.125, 0.032), smoothstep(0.0, 0.85, vTint));
+        base = mix(base, vec3(0.13, 0.12, 0.035), smoothstep(0.93, 1.0, vTint));    /* the odd yellowing one */
+    }
     float ao = abs(vAO);
-    float diff = max(dot(n, uSunDir) * 0.75 + 0.25, 0.0);
-    float back = pow(max(dot(rd, uSunDir), 0.0), 5.0) * 0.7;
-    vec3 light = uSunCol * (diff + back) * vShadow * mix(0.6, 1.0, ao) + mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * ao;
-    oCol = vec4(atmos(base * light, rd, dist, 6, hash12(gl_FragCoord.xy)), 1.0);
+    /* gaps between clumps: darker, and shadowed from the sun */
+    /* clumps only up close: further out they'd just be noise */
+    float cn = trunk ? 0.0 : 1.0 - smoothstep(60.0, 350.0, dist);
+    float cl = mix(0.7, smoothstep(0.2, 0.8, clump), cn);
+    base *= 0.8 + 0.35 * cl;
+    float self = mix(1.0, clamp(0.65 + (clump - clumpL) * 5.0, 0.35, 1.15) * mix(0.8, 1.0, cl), cn);
+    float diff = max(dot(n, uSunDir) * 0.8 + 0.2, 0.0) * self;
+    /* sun through the leaves at the crown's edges when it's behind the tree */
+    float rim = 1.0 - abs(dot(n, rd));
+    float back = pow(max(dot(rd, uSunDir), 0.0), 4.0) * (0.35 + 0.9 * rim * rim) * (trunk ? 0.0 : 1.0);
+    vec3 light = uSunCol * (diff + back * vec3(0.8, 1.3, 0.5)) * vShadow * mix(0.55, 1.0, ao) +
+                 mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * ao * mix(0.6, 1.0, cl);
+    oCol = vec4(atmos(base * light, rd, dist, 6, ign(gl_FragCoord.xy)), 1.0);
 }
 );
 
@@ -839,9 +998,10 @@ vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59
 void main() {
     vec3 c = texture(uSrc, vUV).rgb;
     if (uSharpen > 0.0) {
-        vec3 nb = texture(uSrc, vUV + vec2(uTexel.x, 0.0)).rgb + texture(uSrc, vUV - vec2(uTexel.x, 0.0)).rgb +
-                  texture(uSrc, vUV + vec2(0.0, uTexel.y)).rgb + texture(uSrc, vUV - vec2(0.0, uTexel.y)).rgb;
-        c = max(c + (c * 4.0 - nb) * 0.25 * uSharpen, vec3(0.0));
+        /* unsharp mask against a local blur: two bilinear taps half a texel
+         * off diagonally average the 3x3 neighbourhood */
+        vec3 blur = 0.5 * (texture(uSrc, vUV + 0.5 * uTexel).rgb + texture(uSrc, vUV - 0.5 * uTexel).rgb);
+        c = max(c + (c - blur) * 1.6 * uSharpen, vec3(0.0));
     }
     c += texture(uBloom, vUV).rgb * uBloomAmt;
     c = aces(c * uExposure);
@@ -856,15 +1016,15 @@ void main() {
 );
 
 /* ---- GL state ---- */
-static GLuint p_sky, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
-static GLuint vao_empty, vao_terr, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3;
-static int terr_nverts;
-#define NQ 112                        /* quads per clipmap level side */
-#define LEVELS 6
+static GLuint p_sky, p_cloud, p_tree_solid, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
+static GLuint vao_empty, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3;
 #define FOG_FAR 14000.0f
 
 /* offscreen targets */
 static GLuint fbo_scene, tex_scene, rb_depth, fbo_final, tex_final;
+static GLuint fbo_cloud[2], tex_cloud[2];     /* sky clouds at half res, this frame's and last's (ping-pong) */
+static int cloud_w, cloud_h;
+static int cloud_cur, cloud_hist;             /* cloud_hist: tex_cloud[!cloud_cur] is valid */
 static int scene_w, scene_h;
 #define NBLOOM 5
 static GLuint fbo_bloom[NBLOOM], tex_bloom[NBLOOM];
@@ -895,8 +1055,15 @@ static void resize_scene(int w, int h) {
     if (tex_scene) {
         glDeleteTextures(1, &tex_scene); glDeleteRenderbuffers(1, &rb_depth); glDeleteFramebuffers(1, &fbo_scene);
         glDeleteTextures(NBLOOM, tex_bloom); glDeleteFramebuffers(NBLOOM, fbo_bloom);
+        glDeleteTextures(2, tex_cloud); glDeleteFramebuffers(2, fbo_cloud);
     }
-    tex_scene = mk_tex2d(GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+    for (int i = 0; i < 2; i++) {
+        cloud_w = (w + 1) / 2; cloud_h = (h + 1) / 2;
+        tex_cloud[i] = mk_tex2d(GL_RGBA16F, cloud_w, cloud_h, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+        fbo_cloud[i] = mk_fbo(tex_cloud[i]);
+    }
+    cloud_hist = 0;
+    tex_scene = mk_tex2d(GL_R11F_G11F_B10F, w, h, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);   /* HDR; alpha unused */
     glGenRenderbuffers(1, &rb_depth);
     glBindRenderbuffer(GL_RENDERBUFFER, rb_depth);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, w, h);
@@ -1005,7 +1172,7 @@ static void make_noise(void) {
 /* ---- trees ---- */
 /* Meshes are in unit space: y scaled by the tree's height, x/z by its width.
  * Vertex: position, normal, ao (negative = bark). */
-typedef struct { float *v; int n, cap; } Mesh;
+typedef struct { float *v; int n, cap; GLushort *idx; int ni; } Mesh;   /* v: n * 7 (pos, normal, ao); idx after mesh_index() */
 static Mesh tmesh[4];                  /* pine near, pine far, broadleaf near, broadleaf far */
 static GLuint vao_tree[4], vbo_tree_inst;
 
@@ -1039,19 +1206,23 @@ static void gen_trunk(Mesh *m, float r, float y1, int seg) {
     }
 }
 
+/* tiers of branches: each a star-shaped skirt whose tips droop */
 static void gen_pine(Mesh *m, int layers, int seg, int detail) {
-    static const float yb[4] = {0.10f, 0.32f, 0.52f, 0.70f}, yt[4] = {0.56f, 0.73f, 0.87f, 1.0f}, rb[4] = {0.42f, 0.34f, 0.26f, 0.17f};
-    static const float yb2[2] = {0.12f, 0.50f}, yt2[2] = {0.72f, 1.0f}, rb2[2] = {0.40f, 0.26f};
     if (detail) gen_trunk(m, 0.035f, 0.35f, 5);
     for (int L = 0; L < layers; L++) {
-        float b = layers == 4 ? yb[L] : yb2[L], t = layers == 4 ? yt[L] : yt2[L], r = layers == 4 ? rb[L] : rb2[L];
         float f = (float)L / (layers - 1);
+        float b = 0.10f + 0.62f * powf(f, 0.9f), t = b + 0.36f - 0.1f * f, r = 0.44f - 0.28f * f;
+        if (L == layers - 1) t = 1.0f;
         float apex[3] = {0, t, 0}, up[3] = {0, 1, 0};
         for (int s = 0; s < seg; s++) {
             float a0 = (s + 0.5f * L) * 2 * (float)M_PI / seg, a1 = (s + 1 + 0.5f * L) * 2 * (float)M_PI / seg;
-            float r0 = r * (0.85f + 0.3f * rand01(s, L, 800)), r1 = r * (0.85f + 0.3f * rand01((s + 1) % seg, L, 800));
-            float p0[3] = {cosf(a0) * r0, b - 0.03f * rand01(s, L, 801), sinf(a0) * r0};
-            float p1[3] = {cosf(a1) * r1, b - 0.03f * rand01((s + 1) % seg, L, 801), sinf(a1) * r1};
+            /* even corners are branch tips (long, drooping), odd ones notches */
+            int s1 = (s + 1) % seg;
+            float k0 = s & 1 ? 0.72f : 1.08f, k1 = s1 & 1 ? 0.72f : 1.08f;
+            float r0 = r * k0 * (0.9f + 0.2f * rand01(s, L, 800)), r1 = r * k1 * (0.9f + 0.2f * rand01(s1, L, 800));
+            float d0 = s & 1 ? 0.03f : -0.05f, d1 = s1 & 1 ? 0.03f : -0.05f;
+            float p0[3] = {cosf(a0) * r0, b + d0 * (t - b), sinf(a0) * r0};
+            float p1[3] = {cosf(a1) * r1, b + d1 * (t - b), sinf(a1) * r1};
             float n0[3] = {cosf(a0) * (t - b), r * 1.2f, sinf(a0) * (t - b)}, n1[3] = {cosf(a1) * (t - b), r * 1.2f, sinf(a1) * (t - b)};
             norm3(n0); norm3(n1);
             float na[3] = {(n0[0] + n1[0]) * 0.3f, 1, (n0[2] + n1[2]) * 0.3f};
@@ -1097,26 +1268,38 @@ static void gen_blob(Mesh *m, const float ctr[3], const float rad[3], int subdiv
             for (int k = 0; k < 3; k++) { p[v][k] = ctr[k] + d[k] * rad[k] * lump; n[v][k] = d[k]; out[k] += d[k]; }
             ao[v] = 0.35f + 0.65f * (d[1] * 0.5f + 0.5f);
         }
-        /* half face normal, half sphere normal: lumps read but stay soft */
-        float u[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]}, w[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
-        float fn[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
-        norm3(fn);
-        if (fn[0] * out[0] + fn[1] * out[1] + fn[2] * out[2] < 0) for (int k = 0; k < 3; k++) fn[k] = -fn[k];
-        for (int v = 0; v < 3; v++) { for (int k = 0; k < 3; k++) n[v][k] = n[v][k] * 0.5f + fn[k] * 0.5f; norm3(n[v]); }
+        /* smooth sphere normals (shared vertices); the leaf clumps in the
+         * shader give the surface its texture */
         mesh_tri(m, p[0], p[1], p[2], n[0], n[1], n[2], ao[0], ao[1], ao[2], out);
     }
 }
 
 static void gen_broadleaf(Mesh *m, int detail) {
     if (detail) gen_trunk(m, 0.045f, 0.5f, 5);
-    float c0[3] = {0, 0.58f, 0}, r0[3] = {0.40f, 0.30f, 0.40f};
-    gen_blob(m, c0, r0, detail, 820);
-    if (detail) {
-        float c1[3] = {0.12f, 0.80f, -0.06f}, r1[3] = {0.26f, 0.20f, 0.26f};
-        float c2[3] = {-0.16f, 0.70f, 0.12f}, r2[3] = {0.25f, 0.2f, 0.25f};
-        gen_blob(m, c1, r1, 1, 821);
-        gen_blob(m, c2, r2, 1, 822);
+    /* a main mass with lumps around and on top, so the outline is cloud-like */
+    static const float lump[5][6] = {
+        {0, 0.58f, 0, 0.38f, 0.28f, 0.38f},
+        {0.10f, 0.80f, -0.06f, 0.26f, 0.20f, 0.26f},
+        {-0.15f, 0.72f, 0.12f, 0.25f, 0.20f, 0.25f},
+        {0.22f, 0.58f, 0.14f, 0.22f, 0.18f, 0.22f},
+        {-0.12f, 0.55f, -0.24f, 0.22f, 0.18f, 0.22f},
+    };
+    for (int i = 0; i < (detail ? 5 : 2); i++) gen_blob(m, lump[i], lump[i] + 3, detail && i == 0, 820 + i);
+}
+
+/* merge identical vertices and index them, so each is shaded once per tree */
+static void mesh_index(Mesh *m) {
+    m->idx = malloc(sizeof(GLushort) * m->n);
+    m->ni = m->n;
+    int nu = 0;
+    for (int i = 0; i < m->n; i++) {
+        const float *a = m->v + 7 * i;
+        int j = 0;
+        while (j < nu && memcmp(m->v + 7 * j, a, sizeof(float) * 7)) j++;
+        if (j == nu) memmove(m->v + 7 * nu++, a, sizeof(float) * 7);
+        m->idx[i] = (GLushort)j;
     }
+    m->n = nu;
 }
 
 /* Tree chunks: 128 m squares, generated once from the fine heightmap and kept
@@ -1124,7 +1307,11 @@ static void gen_broadleaf(Mesh *m, int detail) {
 #define TCH 128.0
 #define TRING 64
 #define TREE_R 1500.0f
-#define TREE_NEAR 420.0f
+#define TREE_NEAR 420.0f             /* near -> far mesh, crossfaded over +-TREE_BAND */
+#define TREE_BAND 60.0f
+#define THIN0 650.0f                     /* distance thinning, see trees_update() */
+#define THIN1 1050.0f
+#define FADE0 (TREE_R * 0.72f)            /* trees fade out (dithered) from here to TREE_R */
 typedef struct { int32_t cx, cz; int n, valid; float *inst; } TChunk;   /* inst: n * 8 */
 static TChunk tchunk[TRING * TRING];
 static float *tinst;
@@ -1161,44 +1348,81 @@ static void tchunk_gen(TChunk *c, int32_t cx, int32_t cz) {
     c->inst = realloc(buf, sizeof(float) * 8 * (c->n ? c->n : 1));
 }
 
-static int tree_count[4];
+/* per mesh (pine near/far, broadleaf near/far), solid then dithered: the
+ * dithered ones (LOD crossfade, distance fade) need the shader that can
+ * discard, which forgoes early depth rejection, so only they get it */
+static int tree_count[8];
+
+static int chunk_dist(const void *a, const void *b) {
+    const int *p = a, *q = b;
+    return (p[0] * p[0] + p[1] * p[1]) - (q[0] * q[0] + q[1] * q[1]);
+}
 
 /* gather visible trees into 4 LOD/type ranges; returns total */
 static void trees_update(void) {
     int32_t ccx = (int32_t)floor(fl.x / TCH), ccz = (int32_t)floor(fl.z / TCH);
     int R = (int)ceil(TREE_R / TCH) + 1, gens = 0;
     float fx = -sinf(fl.yaw), fz = -cosf(fl.yaw);
-    static float *lists[4];
-    static int caps[4];
-    int cnt[4] = {0, 0, 0, 0};
-    for (int dz = -R; dz <= R; dz++)
-        for (int dx = -R; dx <= R; dx++) {
-            int32_t cx = ccx + dx, cz = ccz + dz;
-            float ox = (float)(cx * TCH - fl.x), oz = (float)(cz * TCH - fl.z);
-            float mx = ox + (float)TCH / 2, mz = oz + (float)TCH / 2, md = sqrtf(mx * mx + mz * mz);
-            if (md > TREE_R + 92) continue;
-            if (mx * fx + mz * fz < -140 && md > 200) continue;
-            TChunk *c = &tchunk[(cz & (TRING - 1)) * TRING + (cx & (TRING - 1))];
-            if (!c->valid || c->cx != cx || c->cz != cz) {
-                if (gens >= 24 && md > 300) continue;
-                tchunk_gen(c, cx, cz);
-                gens++;
+    static float *lists[8];
+    static int caps[8];
+    int cnt[8] = {0};
+    /* chunks nearest first, so the trees draw roughly front to back */
+    static int (*ord)[2], nord;
+    if (!ord) {
+        ord = malloc(sizeof *ord * (2 * R + 1) * (2 * R + 1));
+        for (int dz = -R; dz <= R; dz++)
+            for (int dx = -R; dx <= R; dx++) { ord[nord][0] = dx; ord[nord][1] = dz; nord++; }
+        qsort(ord, nord, sizeof *ord, chunk_dist);
+    }
+    for (int oi = 0; oi < nord; oi++) {
+        int dx = ord[oi][0], dz = ord[oi][1];
+        int32_t cx = ccx + dx, cz = ccz + dz;
+        float ox = (float)(cx * TCH - fl.x), oz = (float)(cz * TCH - fl.z);
+        float mx = ox + (float)TCH / 2, mz = oz + (float)TCH / 2, md = sqrtf(mx * mx + mz * mz);
+        if (md > TREE_R + 92) continue;
+        if (mx * fx + mz * fz < -140 && md > 200) continue;
+        TChunk *c = &tchunk[(cz & (TRING - 1)) * TRING + (cx & (TRING - 1))];
+        if (!c->valid || c->cx != cx || c->cz != cz) {
+            if (gens >= 24 && md > 300) continue;
+            tchunk_gen(c, cx, cz);
+            gens++;
+        }
+        for (int t = 0; t < c->n; t++) {
+            const float *s = c->inst + 8 * t;
+            float x = ox + s[0], z = oz + s[2], d2 = x * x + z * z;
+            if (d2 > TREE_R * TREE_R) continue;
+            /* thin out with distance: half the trees shrink away between
+             * THIN0 and THIN1 (each at its own distance), the rest grow
+             * to cover for them, so the forest keeps its look for half
+             * the vertices */
+            float grow = 1, u = s[6] / 6.2832f;
+            if (d2 > THIN0 * THIN0) {
+                float d = sqrtf(d2);
+                if (u < 0.5f) {
+                    float gone = THIN0 + (THIN1 - THIN0) * u * 2;
+                    if (d > gone) continue;
+                    grow = fminf((gone - d) / 80.0f, 1.0f);
+                } else grow = 1 + 0.41f * smoothstep(THIN0, THIN1, d);
             }
-            for (int t = 0; t < c->n; t++) {
-                const float *s = c->inst + 8 * t;
-                float x = ox + s[0], z = oz + s[2], d2 = x * x + z * z;
-                if (d2 > TREE_R * TREE_R) continue;
-                int k = (int)s[7] * 2 + (d2 > TREE_NEAR * TREE_NEAR);
+            /* in the crossfade band a tree goes in both lists */
+            float lo = TREE_NEAR - TREE_BAND, hi = TREE_NEAR + TREE_BAND;
+            int use[2] = {d2 < hi * hi, d2 > lo * lo};
+            int dith = (d2 > lo * lo && d2 < hi * hi) || d2 > FADE0 * FADE0;
+            for (int far = 0; far < 2; far++) {
+                if (!use[far]) continue;
+                int k = ((int)s[7] * 2 + far) * 2 + dith;
                 if (cnt[k] == caps[k]) { caps[k] = caps[k] ? caps[k] * 2 : 4096; lists[k] = realloc(lists[k], sizeof(float) * 8 * caps[k]); }
                 float *o = lists[k] + 8 * cnt[k]++;
                 memcpy(o, s, sizeof(float) * 8);
-                o[0] = x; o[2] = z;
+                o[0] = x; o[2] = z; o[3] *= grow; o[4] *= grow;
             }
         }
-    int total = cnt[0] + cnt[1] + cnt[2] + cnt[3];
+    }
+    int total = 0;
+    for (int k = 0; k < 8; k++) total += cnt[k];
     if (total > tinst_cap) { tinst_cap = total * 2; tinst = realloc(tinst, sizeof(float) * 8 * tinst_cap); }
     int off = 0;
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < 8; k++) {
         memcpy(tinst + 8 * off, lists[k], sizeof(float) * 8 * cnt[k]);
         tree_count[k] = cnt[k];
         off += cnt[k];
@@ -1292,6 +1516,7 @@ static void setup_matrices(void) {
 
 static float sim_time;
 
+static float pix_ang;                     /* radians per scene pixel */
 static void set_common(GLuint p) {
     glUseProgram(p);
     glUniform3fv(UL(p, "uSunDir"), 1, pal.sun_dir);
@@ -1319,8 +1544,9 @@ static void set_common(GLuint p) {
     glUniform1f(UL(p, "uCloudCover"), pal.cover);
     glUniform1f(UL(p, "uCloudDens"), pal.cdens);
     glUniform1f(UL(p, "uCloudsOn"), (float)opt_clouds);
-    glUniform2f(UL(p, "uT0Cam"), (float)fmod(fl.x / BASE, 512.0), (float)fmod(fl.z / BASE, 512.0));
+    glUniform2f(UL(p, "uT0Cam"), (float)fmod(fl.x / BASE, 1024.0), (float)fmod(fl.z / BASE, 1024.0));
     glUniform2f(UL(p, "uT1Cam"), (float)fmod(fl.x / (4 * BASE), 1024.0), (float)fmod(fl.z / (4 * BASE), 1024.0));
+    glUniform1f(UL(p, "uPixAng"), pix_ang);
     glUniformMatrix4fv(UL(p, "uVP"), 1, GL_FALSE, vp);
 }
 
@@ -1343,45 +1569,62 @@ static void bake_step(void) {
     glDisable(GL_SCISSOR_TEST);
 }
 
+#define PATCH_CELLS 64                 /* fine cells per terrain patch side: 512 m */
+#define TESS_PX 6.0f                   /* target triangle width, pixels */
+static GLuint ssbo_patch;
+static int patch_np(void) { return 2 * (int)ceil(FOG_FAR / (BASE * PATCH_CELLS)) + 2; }
+static int patch_dist(const void *a, const void *b) {
+    const int *p = a, *q = b, c = patch_np() / 2;
+    int da = (p[0] - c) * (p[0] - c) + (p[1] - c) * (p[1] - c), db = (q[0] - c) * (q[0] - c) + (q[1] - c) * (q[1] - c);
+    return da - db;
+}
+static void patch_init(void) {
+    int np = patch_np();
+    int *o = malloc(sizeof(int) * 2 * np * np);
+    for (int i = 0; i < np * np; i++) { o[2 * i] = i % np; o[2 * i + 1] = i / np; }
+    qsort(o, np * np, sizeof(int) * 2, patch_dist);
+    glGenBuffers(1, &ssbo_patch);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_patch);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int) * 2 * np * np, o, GL_STATIC_DRAW);
+    free(o);
+}
+
 static void draw_terrain(void) {
     set_common(p_terr);
     int32_t ccx = (int32_t)floor(fl.x / BASE), ccz = (int32_t)floor(fl.z / BASE);
     glUniform2i(UL(p_terr, "uCamCell"), ccx, ccz);
     glUniform2f(UL(p_terr, "uCamFrac"), (float)(fl.x - ccx * BASE), (float)(fl.z - ccz * BASE));
-    glUniform1i(UL(p_terr, "uNQ"), NQ);
-    GLint l_org = UL(p_terr, "uOrg"), l_mul = UL(p_terr, "uMul"), l_sel = UL(p_terr, "uTexSel"),
-          l_hole = UL(p_terr, "uHole"), l_morph = UL(p_terr, "uMorph");
-    glBindVertexArray(vao_terr);
-    int32_t prev_ox = 0, prev_oz = 0;
-    for (int k = 0; k < LEVELS; k++) {
-        int mul = 1 << k;
-        double sp = BASE * mul;
-        int32_t ox = ((int32_t)floor(fl.x / sp) - NQ / 2) & ~1, oz = ((int32_t)floor(fl.z / sp) - NQ / 2) & ~1;
-        glUniform2i(l_org, ox, oz);
-        glUniform1i(l_mul, mul);
-        glUniform1i(l_sel, k < 2 ? 0 : 1);
-        glUniform1f(l_morph, k < LEVELS - 1 ? 1.0f : 0.0f);
-        if (k == 0) glUniform4i(l_hole, 0, 0, 0, 0);
-        else {
-            int32_t hx = prev_ox / 2 - ox, hz = prev_oz / 2 - oz;
-            glUniform4i(l_hole, hx, hz, hx + NQ / 2, hz + NQ / 2);
-        }
-        glDrawArrays(GL_TRIANGLES, 0, terr_nverts);
-        prev_ox = ox; prev_oz = oz;
-    }
+    /* the tessellation follows the shared virtual camera, not this instance's
+     * render scale, so spanned monitors cut the ground identically */
+    glUniform1f(UL(p_terr, "uTessK"), cam_f / TESS_PX);
+    double ps = BASE * PATCH_CELLS;
+    int np = patch_np();
+    glUniform2i(UL(p_terr, "uPatch0"), (int32_t)floor(fl.x / ps) - np / 2, (int32_t)floor(fl.z / ps) - np / 2);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_patch);
+    glUniform1i(UL(p_terr, "uPatchCells"), PATCH_CELLS);
+    glPatchParameteri(GL_PATCH_VERTICES, 4);
+    glBindVertexArray(vao_empty);
+    glDrawArraysInstanced(GL_PATCHES, 0, 4, np * np);
 }
 
 static void draw_trees(void) {
-    set_common(p_tree);
-    glUniform1f(UL(p_tree, "uTreeR"), TREE_R);
     glEnable(GL_CULL_FACE);
-    int off = 0;
-    for (int k = 0; k < 4; k++) {
-        if (tree_count[k]) {
-            glBindVertexArray(vao_tree[k]);
-            glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 0, tmesh[k].n, tree_count[k], off);
+    for (int dith = 0; dith < 2; dith++) {
+        GLuint p = dith ? p_tree : p_tree_solid;
+        set_common(p);
+        glUniform1f(UL(p, "uTreeR"), TREE_R);
+        glUniform1f(UL(p, "uTreeNear"), TREE_NEAR);
+        glUniform1f(UL(p, "uTreeBand"), TREE_BAND);
+        int off = 0;
+        for (int r = 0; r < 8; r++) {
+            int k = r >> 1;
+            if (tree_count[r] && (r & 1) == dith) {
+                glBindVertexArray(vao_tree[k]);
+                glUniform1i(UL(p, "uFar"), k & 1);
+                glDrawElementsInstancedBaseInstance(GL_TRIANGLES, tmesh[k].ni, GL_UNSIGNED_SHORT, NULL, tree_count[r], off);
+            }
+            off += tree_count[r];
         }
-        off += tree_count[k];
     }
     glDisable(GL_CULL_FACE);
 }
@@ -1558,16 +1801,61 @@ static void draw_hud(void) {
 
 static float render_scale = 1.0f;
 
+static void draw_clouds(void) {
+    static float prev_tan[4], prev_rot[9];
+    static double prev_x, prev_y, prev_z;
+    static unsigned frame;
+    cloud_cur ^= 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_cloud[cloud_cur]);
+    glViewport(0, 0, cloud_w, cloud_h);
+    set_common(p_cloud);
+    glUniform4fv(UL(p_cloud, "uViewTan"), 1, view_tan);
+    glUniformMatrix3fv(UL(p_cloud, "uCamRot"), 1, GL_FALSE, rot3);
+    glUniform4fv(UL(p_cloud, "uPrevTan"), 1, prev_tan);
+    glUniformMatrix3fv(UL(p_cloud, "uPrevRot"), 1, GL_FALSE, prev_rot);
+    glUniform3f(UL(p_cloud, "uPrevCam"), (float)(prev_x - fl.x), (float)(prev_y - fl.y), (float)(prev_z - fl.z));
+    /* a big jump (seek, first frame) means the history is someone else's sky */
+    double jump = fabs(prev_x - fl.x) + fabs(prev_z - fl.z);
+    glUniform1f(UL(p_cloud, "uHistW"), cloud_hist && jump < 200 ? 0.85f : 0.0f);
+    glUniform1f(UL(p_cloud, "uFrame"), (float)(frame++ & 1023));
+    glUniform1f(UL(p_cloud, "uPixAng"), pix_ang * 2);        /* half res */
+    glActiveTexture(GL_TEXTURE8);
+    glBindTexture(GL_TEXTURE_2D, tex_cloud[!cloud_cur]);
+    fullscreen();
+    glBindTexture(GL_TEXTURE_2D, tex_cloud[cloud_cur]);     /* for the sky pass */
+    glActiveTexture(GL_TEXTURE7);
+    memcpy(prev_tan, view_tan, sizeof prev_tan);
+    memcpy(prev_rot, rot3, sizeof prev_rot);
+    prev_x = fl.x; prev_y = fl.y; prev_z = fl.z;
+    cloud_hist = 1;
+}
+
+/* --bench: GPU time per pass, from timestamps between them */
+enum { PR_BAKE, PR_CLOUD, PR_TREE, PR_TERR, PR_SKY, PR_WATER, PR_POST, PR_N };
+static const char *prof_name[PR_N] = {"bake", "clouds", "trees", "terrain", "sky", "water", "post"};
+static GLuint prof_q[PR_N + 1];
+static double prof_ms[PR_N];
+static int prof_on;
+static void prof_mark(int i) { if (prof_on) glQueryCounter(prof_q[i], GL_TIMESTAMP); }
+static void prof_collect(void) {
+    if (!prof_on) return;
+    GLuint64 t[PR_N + 1];
+    for (int i = 0; i <= PR_N; i++) glGetQueryObjectui64v(prof_q[i], GL_QUERY_RESULT, &t[i]);
+    for (int i = 0; i < PR_N; i++) prof_ms[i] += (t[i + 1] - t[i]) * 1e-6;
+}
+
 static void render(GLuint target) {
     setup_view();
     setup_matrices();
     hm_update(&hm[0], fl.x, fl.z);
     hm_update(&hm[1], fl.x, fl.z);
     if (opt_trees) trees_update();
+    prof_mark(PR_BAKE);
     bake_step();
 
     int sw = (int)(W * render_scale + 0.5f), sh = (int)(H * render_scale + 0.5f);
     resize_scene(sw < 16 ? 16 : sw, sh < 16 ? 16 : sh);
+    pix_ang = 1.0f / (cam_f * render_scale);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene);
     glViewport(0, 0, scene_w, scene_h);
     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
@@ -1575,23 +1863,38 @@ static void render(GLuint target) {
     glClear(GL_DEPTH_BUFFER_BIT);
     glDepthFunc(GL_GREATER);
 
-    glDisable(GL_DEPTH_TEST);
+    prof_mark(PR_CLOUD);
+    if (opt_clouds) draw_clouds();
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene);
+    glViewport(0, 0, scene_w, scene_h);
+    glEnable(GL_DEPTH_TEST);
+
+    /* trees first: the terrain's costly shading then skips what they hide */
+    prof_mark(PR_TREE);
+    if (opt_trees) draw_trees();
+    prof_mark(PR_TERR);
+    draw_terrain();
+
+    /* sky only where nothing was drawn: it sits at the far plane (depth 0) */
+    prof_mark(PR_SKY);
     glDepthMask(GL_FALSE);
+    glDepthFunc(GL_GEQUAL);
     set_common(p_sky);
     glUniform4fv(UL(p_sky, "uViewTan"), 1, view_tan);
     glUniformMatrix3fv(UL(p_sky, "uCamRot"), 1, GL_FALSE, rot3);
     fullscreen();
+    glDepthFunc(GL_GREATER);
     glDepthMask(GL_TRUE);
-    glEnable(GL_DEPTH_TEST);
 
-    draw_terrain();
-    if (opt_trees) draw_trees();
+    prof_mark(PR_WATER);
     draw_water();
 
     glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     glDepthFunc(GL_LESS);
+    prof_mark(PR_POST);
     post(target);
     if (opt_hud) draw_hud();
+    prof_mark(PR_N);
 }
 
 static void gl_init(void) {
@@ -1603,9 +1906,12 @@ static void gl_init(void) {
     }
     GLSL_COMMON = COMMON_SRC;
     p_sky = program("sky", VS_FULL, FS_SKY);
-    p_terr = program("terrain", VS_TERRAIN, FS_TERRAIN);
+    p_cloud = program("cloud", VS_FULL, FS_CLOUD);
+    p_terr = program_tess("terrain", VS_TERRAIN, TCS_TERRAIN, TES_TERRAIN, FS_TERRAIN);
+    patch_init();
     p_water = program("water", VS_WATER, FS_WATER);
-    p_tree = program("tree", VS_TREE, FS_TREE);
+    p_tree = program_full("tree", VS_TREE, NULL, NULL, FS_TREE, "const bool kDither = true;\n");
+    p_tree_solid = program_full("tree", VS_TREE, NULL, NULL, FS_TREE, "layout(early_fragment_tests) in;\nconst bool kDither = false;\n");
     p_bake = program("bake", VS_FULL, FS_BAKE);
     p_down = program("down", VS_FULL, FS_DOWN);
     p_up = program("up", VS_FULL, FS_UP);
@@ -1616,7 +1922,8 @@ static void gl_init(void) {
     for (int i = 0; i < 2; i++) {
         HMap *m = &hm[i];
         m->data = calloc((size_t)m->n * m->n * 2, sizeof(float));
-        m->tex = mk_tex2d(GL_RG32F, m->n, m->n, GL_RG, GL_FLOAT, NULL, GL_LINEAR, GL_REPEAT);
+        m->tex = mk_tex2d(GL_RG32F, m->n, m->n, GL_RG, GL_FLOAT, NULL, GL_LINEAR_MIPMAP_LINEAR, GL_REPEAT);
+        glGenerateMipmap(GL_TEXTURE_2D);
     }
     tex_shadow = mk_tex2d(GL_RG8, 1024, 1024, GL_RG, GL_UNSIGNED_BYTE, NULL, GL_LINEAR, GL_REPEAT);
     fbo_bake = mk_fbo(tex_shadow);
@@ -1628,35 +1935,7 @@ static void gl_init(void) {
     }
     glActiveTexture(GL_TEXTURE7);       /* scratch unit for uploads */
 
-    /* clipmap grid: every quad as 2 triangles, each vertex tagged with its quad */
-    terr_nverts = NQ * NQ * 6;
-    short *g = malloc(sizeof(short) * 4 * terr_nverts), *o = g;
-    for (int qz = 0; qz < NQ; qz++)
-        for (int qx = 0; qx < NQ; qx++) {
-            int c[6][2];
-            if ((qx + qz) & 1) {
-                int t[6][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 0}, {0, 1}, {1, 1}};
-                memcpy(c, t, sizeof c);
-            } else {
-                int t[6][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 0}, {0, 1}, {1, 1}};
-                memcpy(c, t, sizeof c);
-            }
-            for (int v = 0; v < 6; v++) {
-                *o++ = (short)(qx + c[v][0]); *o++ = (short)(qz + c[v][1]);
-                *o++ = (short)qx; *o++ = (short)qz;
-            }
-        }
     GLuint vbo;
-    glGenVertexArrays(1, &vao_terr);
-    glBindVertexArray(vao_terr);
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(short) * 4 * terr_nverts, g, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribIPointer(0, 2, GL_SHORT, 8, (void *)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribIPointer(1, 2, GL_SHORT, 8, (void *)4);
-    free(g);
 
     static const float wq[12] = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
     glGenVertexArrays(1, &vao_water);
@@ -1668,14 +1947,19 @@ static void gl_init(void) {
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
 
     /* trees */
-    gen_pine(&tmesh[0], 4, 9, 1);
-    gen_pine(&tmesh[1], 2, 5, 0);
+    gen_pine(&tmesh[0], 5, 10, 1);
+    gen_pine(&tmesh[1], 3, 6, 0);
     gen_broadleaf(&tmesh[2], 1);
     gen_broadleaf(&tmesh[3], 0);
     glGenBuffers(1, &vbo_tree_inst);
     for (int k = 0; k < 4; k++) {
+        mesh_index(&tmesh[k]);
         glGenVertexArrays(1, &vao_tree[k]);
         glBindVertexArray(vao_tree[k]);
+        GLuint ibo;
+        glGenBuffers(1, &ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLushort) * tmesh[k].ni, tmesh[k].idx, GL_STATIC_DRAW);
         glGenBuffers(1, &vbo);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 7 * tmesh[k].n, tmesh[k].v, GL_STATIC_DRAW);
@@ -1826,21 +2110,25 @@ int main(int argc, char **argv) {
         render(fbo_final);                 /* warm-up: streams everything, full bake */
         glFinish();
         if (opt_shot) {
-            render(fbo_final);
+            for (int i = 0; i < 24; i++) render(fbo_final);   /* let the cloud accumulation settle */
             save_ppm(opt_shot);
             return 0;
         }
         double t0 = now(), worst = 0;
+        glGenQueries(PR_N + 1, prof_q);
+        prof_on = 1;
         for (int i = 0; i < opt_bench; i++) {
             double f0 = now();
             advance(opt_at + (i + 1) / 60.0);
             render(fbo_final);
             glFinish();
+            prof_collect();
             worst = fmax(worst, now() - f0);
         }
         double per = (now() - t0) / opt_bench;
         printf("%dx%d scale %.2f: %.2f ms/frame avg, %.2f worst (%s)\n", W, H, render_scale, per * 1e3, worst * 1e3,
                (const char *)glGetString(GL_RENDERER));
+        for (int i = 0; i < PR_N; i++) printf("  %-8s %6.2f ms\n", prof_name[i], prof_ms[i] / opt_bench);
         return 0;
     }
 
