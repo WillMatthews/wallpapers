@@ -2078,7 +2078,7 @@ static void draw_water(void) {
 }
 
 /* ---- birds ----
- * Flocks live in BCELL-metre world cells (half of them have one), each
+ * Flocks live in BCELL-metre world cells (most have one), each
  * circling a spot over the ground. Everything is a closed-form function of
  * the sim time, so spanned instances agree without simulating anything. */
 #define BCELL 800.0
@@ -2120,7 +2120,7 @@ static void birds_init(void) {
 }
 
 static void birds_update(void) {
-    enum { MAXB = 1024 };
+    enum { MAXB = 4096 };
     static float inst[MAXB * 8];
     double t = sim_time;
     int32_t ci = (int32_t)floor(fl.x / BCELL), cj = (int32_t)floor(fl.z / BCELL);
@@ -2128,7 +2128,7 @@ static void birds_update(void) {
     for (int dj = -3; dj <= 3; dj++)
         for (int di = -3; di <= 3; di++) {
             int32_t gi = ci + di, gj = cj + dj;
-            if (rand01(gi, gj, 900) > 0.5f) continue;
+            if (rand01(gi, gj, 900) > 0.85f) continue;
             /* the flock: circles radius R at speed v round a spot, often drifting off it */
             double cx = (gi + 0.2 + 0.6 * rand01(gi, gj, 901)) * BCELL, cz = (gj + 0.2 + 0.6 * rand01(gi, gj, 902)) * BCELL;
             float R = 80 + 220 * rand01(gi, gj, 903), v = 11 + 5 * rand01(gi, gj, 904);
@@ -2144,7 +2144,7 @@ static void birds_update(void) {
             hm0_sample(fx + vx * 6, fz + vz * 6, &g1, &fo);
             float gy = fmaxf(fmaxf(g0, g1), 0);
             float fy = gy + 60 + 90 * rand01(gi, gj, 907);
-            int nb = 8 + (int)(28 * rand01(gi, gj, 908));
+            int nb = 12 + (int)(48 * rand01(gi, gj, 908));
             float spread = 10 + 3.0f * sqrtf((float)nb);
             float roll = -dir * atanf(v * v / (R * 9.8f));
             for (int b = 0; b < nb && bird_n < MAXB; b++) {
