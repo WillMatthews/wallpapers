@@ -163,6 +163,7 @@ static const Preset presets[] = {
 static struct {
     float sun_dir[3], sun[3], zen[3], hor[3], hor_sun[3], amb_sky[3], amb_gnd[3];
     float fog_a, fog_b, haze, cover, cbase, cthick, cdens, exposure, glow, stars, disc, sat;
+    float mist;                      /* valley mist density, 1/m */
 } pal;
 
 static float lin(float c) { return powf(c, 2.2f); }
@@ -188,6 +189,8 @@ static void choose_palette(void) {
     pal.fog_a = p->fog_a; pal.fog_b = p->fog_b; pal.haze = p->haze;
     pal.cover = p->cover; pal.cbase = p->cbase; pal.cthick = p->cthick; pal.cdens = p->cdens;
     pal.exposure = p->exposure; pal.glow = p->glow; pal.stars = p->stars; pal.disc = p->disc; pal.sat = p->sat;
+    /* valley mist: thick with the sun low, lingering at night, wisps by day */
+    pal.mist = p->stars > 0.5f ? 0.0012f : 0.0004f + 0.0014f * (1 - smoothstep(4, 25, p->el));
 }
 
 /* ---- flight model (an autopilot, really) ---- */
@@ -414,6 +417,7 @@ uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uZen; uniform vec3 uHor
 uniform vec3 uAmbSky; uniform vec3 uAmbGnd;
 uniform float uCamY; uniform float uTime;
 uniform float uFogA; uniform float uFogB; uniform float uHaze; uniform float uFogFar;
+uniform float uMist;                 /* valley mist density inside the layer (1/m); 0 = none */
 uniform float uGlow; uniform float uStars; uniform float uDisc;
 uniform vec2 uWorldMod; uniform vec2 uCloudMod;
 uniform float uCloudBase; uniform float uCloudThick; uniform float uCloudCover; uniform float uCloudDens; uniform float uCloudsOn;
@@ -471,6 +475,40 @@ float fogTrans(vec3 rd, float t) {
     return exp(-od) * (1.0 - smoothstep(uFogFar * 0.7, uFogFar, t));
 }
 vec3 fogColor(vec3 rd) { return skyBase(rd); }
+
+/* Valley mist: a layer whose top sits a little under the ground's average
+ * height over ~2 km (so it pools in whatever valleys there are, and over the
+ * lakes), full density below the top and thinning fast above it. */
+float mistTop(vec2 xz) {
+    return max(textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, 6.0).r - 80.0, 12.0);
+}
+/* optical depth along rd for t metres: the height above the mist top runs
+ * linearly from the camera's to the end's, so it integrates exactly */
+float mistDepth(vec3 rd, float t) {
+    if (uMist <= 0.0) return 0.0;
+    vec3 e = rd * t;
+    const float Hm = 20.0;
+    float u0 = uCamY - mistTop(vec2(0.0)), u1 = uCamY + e.y - mistTop(e.xz);
+    /* antiderivative of the density profile (over height above the top) */
+    vec2 F = vec2(u0, u1);
+    F = mix(F, Hm * (1.0 - exp(-F / Hm)), step(0.0, F));
+    float du = u1 - u0;
+    float od = abs(du) > 1e-3 ? (F.y - F.x) / du : (u0 < 0.0 ? 1.0 : exp(-u0 / Hm));
+    /* patchy, drifting slowly */
+    vec2 w = uWorldMod + e.xz + vec2(uTime * 1.5, uTime * 0.6);
+    float patchy = texture(uNoise2, w / 4000.0).g * 0.75 + texture(uNoise2, w / 1200.0).b * 0.25;
+    return uMist * t * od * smoothstep(0.2, 0.8, patchy) * 1.6;
+}
+/* mist is whiter than the haze, lit a little by the sun */
+vec3 mistColor(vec3 rd) {
+    vec3 f = fogColor(rd);
+    float l = dot(f, vec3(0.2126, 0.7152, 0.0722));
+    return mix(f, vec3(l * 1.05), 0.45) + uSunCol * max(uSunDir.y, 0.0) * 0.02;
+}
+vec3 applyMist(vec3 col, vec3 rd, float t, float alpha) {
+    float T = exp(-mistDepth(rd, t));
+    return col * T + mistColor(rd) * (1.0 - T) * alpha;
+}
 
 /* cumulus: a 2D coverage field sets each column's height, 3D billow noise erodes it */
 /* fp: the sample's footprint in metres. The raymarch picks mips itself: the
@@ -557,6 +595,7 @@ vec2 terrShadow(vec3 p) { return texture(uShadow, (uT1Cam + p.xz / 32.0 + 0.5) /
 vec3 atmos(vec3 col, vec3 rd, float t, int steps, float jit) {
     float T = fogTrans(rd, t);
     col = col * T + fogColor(rd) * (1.0 - T);
+    col = applyMist(col, rd, t, 1.0);
     if (uCloudsOn > 0.5 && (uCamY > uCloudBase || rd.y > 0.0)) {
         vec4 c = clouds(rd, t, steps, jit);
         col = col * c.a + c.rgb;
@@ -604,6 +643,7 @@ out vec4 oCol;
 void main() {
     vec3 rd = normalize(uCamRot * vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0));
     vec3 col = skyBase(rd) + sunDisc(rd) + stars(rd);
+    col = applyMist(col, rd, uFogFar, 1.0);
     vec4 c = uCloudsOn > 0.5 ? texture(uCloudTex, vUV) : vec4(0.0, 0.0, 0.0, 1.0);
     oCol = vec4(col * c.a + c.rgb, 1.0);
 }
@@ -835,6 +875,7 @@ void main() {
     alpha = mix(alpha, 1.0, foam * 0.8);
     float T = fogTrans(rd, dist);
     col = col * T + fogColor(rd) * (1.0 - T) * alpha;
+    col = applyMist(col, rd, dist, alpha);
     oCol = vec4(col, alpha);
 }
 );
@@ -1529,6 +1570,7 @@ static void set_common(GLuint p) {
     glUniform1f(UL(p, "uCamY"), fl.y);
     glUniform1f(UL(p, "uTime"), fmodf(sim_time, 4096.0f));
     glUniform1f(UL(p, "uFogA"), pal.fog_a);
+    glUniform1f(UL(p, "uMist"), pal.mist);
     glUniform1f(UL(p, "uFogB"), pal.fog_b);
     glUniform1f(UL(p, "uHaze"), pal.haze);
     glUniform1f(UL(p, "uFogFar"), FOG_FAR);
