@@ -409,6 +409,8 @@ static GLuint program_full(const char *name, const char *vs, const char *tcs, co
     if ((l = glGetUniformLocation(p, "uRefl")) >= 0) glUniform1i(l, 11);
     if ((l = glGetUniformLocation(p, "uReflD")) >= 0) glUniform1i(l, 12);
     if ((l = glGetUniformLocation(p, "uSSR")) >= 0) glUniform1i(l, 13);
+    if ((l = glGetUniformLocation(p, "uWave")) >= 0) glUniform1i(l, 14);
+    if ((l = glGetUniformLocation(p, "uDetail")) >= 0) glUniform1i(l, 15);
     return p;
 }
 
@@ -432,6 +434,7 @@ uniform vec2 uWorldMod; uniform vec2 uCloudMod;
 uniform float uCloudBase; uniform float uCloudThick; uniform float uCloudCover; uniform float uCloudDens; uniform float uCloudsOn;
 uniform sampler2D uH0; uniform sampler2D uH1; uniform sampler2D uShadow;
 uniform sampler2D uNoise2; uniform sampler3D uNoise3;
+uniform sampler2D uDetail;           /* ground detail: RG slope, B soft fbm, A ridged height */
 uniform vec2 uT0Cam; uniform vec2 uT1Cam;
 uniform float uPixAng;               /* radians per scene pixel */
 
@@ -489,7 +492,7 @@ vec3 fogColor(vec3 rd) { return skyBase(rd); }
  * height over ~2 km (so it pools in whatever valleys there are, and over the
  * lakes), full density below the top and thinning fast above it. */
 float mistTop(vec2 xz) {
-    return max(textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, 6.0).r - 80.0, 5.0);
+    return textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, 6.0).r - 80.0;
 }
 /* optical depth along rd for t metres: the height above the mist top runs
  * linearly from the camera's to the end's, so it integrates exactly */
@@ -798,13 +801,38 @@ void main() {
     vec2 w = uWorldMod + p.xz;
     float n1 = nz(w, 1024.0, 0), n2 = nz(w, 256.0, 1), n3 = nz(w, 32.0, 2);
 
-    /* small-scale relief the heightmap can't carry */
-    float near = 1.0 - smoothstep(200.0, 3000.0, dist);
-    if (near > 0.0) {
-        float e = 3.0, s = 48.0;
-        float a = nz(w, s, 3), bx = nz(w + vec2(e, 0.0), s, 3), bz = nz(w + vec2(0.0, e), s, 3);
-        float rockiness = smoothstep(0.15, 0.4, 1.0 - n.y) + 0.35;
-        n = normalize(n - vec3(bx - a, 0.0, bz - a) * 1.6 * near * rockiness);
+    /* small-scale relief the heightmap can't carry: crisp ridged detail at
+     * 128, 32 and 8 m, projected from above and from the side the slope faces
+     * most (so cliffs don't smear), fading out before it would shimmer */
+    float cav = 0.5, cav2 = 0.5;
+    float far = 1.0 - smoothstep(2000.0, 9000.0, dist);
+    float near = 1.0 - smoothstep(300.0, 2500.0, dist), fine = 1.0 - smoothstep(60.0, 600.0, dist);
+    if (far > 0.0) {
+        float rockiness = smoothstep(0.12, 0.4, 1.0 - n.y);
+        vec3 ww = vec3(w.x, p.y, w.y);
+        vec3 bw = pow(abs(n), vec3(4.0));
+        float top = bw.y / (bw.x + bw.y + bw.z);
+        bool sx = bw.x > bw.z;
+        vec2 sideUV = sx ? ww.zy : ww.xy;
+        vec3 dn = vec3(0.0);
+        for (int k = 0; k < 3; k++) {
+            float S = k == 0 ? 128.0 : k == 1 ? 32.0 : 8.0, amt = k == 0 ? far : k == 1 ? near : fine;
+            if (amt <= 0.0) break;
+            /* skip a projection that hardly shows (most ground is flat-ish) */
+            /* (the 128 m layer is seen from afar: its dominant one will do) */
+            float lo = k == 0 ? 0.5 : 0.03;
+            vec4 t0 = top > lo ? texture(uDetail, ww.xz / S) : vec4(0.5);
+            vec4 t1 = top < 1.0 - lo ? texture(uDetail, sideUV / S) : vec4(0.5);
+            vec2 g0 = t0.rg * 2.0 - 1.0, g1 = t1.rg * 2.0 - 1.0;
+            /* a slope in a projection plane tilts the normal against it */
+            vec3 d = vec3(g0.x, 0.0, g0.y) * top;
+            d += (sx ? vec3(0.0, g1.y, g1.x) : vec3(g1.x, g1.y, 0.0)) * (1.0 - top);
+            float str = (k == 0 ? 0.8 : k == 1 ? 1.1 : 0.55) * amt * mix(0.3, 1.0, rockiness);
+            dn += d * str;
+            float c = mix(t0.a, t1.a, 1.0 - top);
+            if (k == 1) cav = mix(0.5, c, amt); else if (k == 2) cav2 = mix(0.5, c, amt);
+        }
+        n = normalize(n - dn);
     }
     float slope = 1.0 - n.y;
     float h = p.y, hN = h + (n2 - 0.5) * 60.0;
@@ -815,12 +843,13 @@ void main() {
     vec3 rock = vec3(0.19, 0.165, 0.14), snow = vec3(0.86, 0.89, 0.94);
     vec3 col = mix(grassA, grassB, smoothstep(0.35, 0.75, n1 * 0.7 + n3 * 0.3));
     col = mix(col, alpine, smoothstep(700.0, 1000.0, hN));
-    col *= 0.85 + 0.3 * n3;
+    col *= (0.85 + 0.3 * n3) * (0.88 + 0.24 * cav2);           /* tufts */
     float fo = smoothstep(0.15, 0.55, forest) * (1.0 - smoothstep(0.35, 0.5, slope));
     col = mix(col, canopy * (0.65 + 0.7 * nz(w, 14.0, 3)), fo);
     col = mix(sand, col, smoothstep(0.5, 3.5, h - 2.0 * n3));
     float strata = 0.9 + 0.1 * sin(h * 0.05 + n2 * 6.0) + 0.25 * (n3 - 0.5);
-    vec3 rc = rock * strata * mix(vec3(1.0), vec3(1.15, 0.95, 0.8), n1);
+    /* rock: crevices dark, ridges and ledges light */
+    vec3 rc = rock * strata * mix(vec3(1.0), vec3(1.15, 0.95, 0.8), n1) * (0.55 + 0.6 * cav) * (0.8 + 0.4 * cav2);
     float rockAmt = smoothstep(0.26, 0.40, slope + (n2 - 0.5) * 0.18) + smoothstep(1250.0, 1500.0, hN) * 0.6;
     col = mix(col, rc, clamp(rockAmt, 0.0, 1.0));
     float snowline = 1080.0 + (n1 - 0.5) * 260.0;
@@ -855,7 +884,14 @@ in vec3 vRel;
 out vec4 oCol;
 uniform sampler2D uSSR;        /* reflections off flat water, quarter res (FS_SSR) */
 uniform vec2 uSceneSize;
-float wav(vec2 w, float s, vec2 v) { return texture(uNoise2, w / s + v * uTime / s).b; }
+uniform sampler2D uWave;
+/* slope of one scrolling, rotated layer of the wave map, tile s metres */
+vec2 waveSlope(vec2 w, float s, float rot, float speed) {
+    float c = cos(rot), sn = sin(rot);
+    vec2 q = mat2(c, -sn, sn, c) * w;
+    vec2 g = texture(uWave, q / s + vec2(uTime * speed / s, 0.0)).rg * 2.0 - 1.0;
+    return mat2(c, sn, -sn, c) * g;
+}
 void main() {
     vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
     float cheb = max(abs(p.x), abs(p.z));
@@ -868,16 +904,13 @@ void main() {
     vec3 rd = (p - cam) / dist;
     vec2 w = uWorldMod + p.xz;
 
-    /* waves: two scrolling octaves, flattened with distance */
-    float amp = 1.0 / (1.0 + dist / 700.0);
-    vec2 g = vec2(0.0);
-    float e = 0.6;
-    for (int i = 0; i < 2; i++) {
-        float s = i == 0 ? 40.0 : 11.0;
-        vec2 v = i == 0 ? vec2(1.3, 0.7) : vec2(-0.8, 1.1);
-        float a = wav(w, s, v);
-        g += vec2(wav(w + vec2(e, 0.0), s, v) - a, wav(w + vec2(0.0, e), s, v) - a) / e * (i == 0 ? 3.0 : 1.2);
-    }
+    /* waves: two layers of the wave map, crossing, drifting with the wind.
+     * Gusts ruffle some patches while others lie glassy (they show the
+     * reflections best), and the shallows are calmer. The map's mips
+     * smooth the slopes with distance. */
+    float gust = smoothstep(0.3, 0.7, texture(uNoise2, (w + vec2(uTime * 4.0, uTime * 1.5)) / 2048.0).g);
+    float amp = mix(0.3, 1.0, gust) * mix(0.5, 1.0, smoothstep(0.5, 5.0, depth));
+    vec2 g = waveSlope(w, 64.0, 0.35, 1.6) * 0.22 + waveSlope(w, 16.0, -0.5, 0.8) * 0.12;
     vec3 n = normalize(vec3(-g.x * amp, 1.0, -g.y * amp));
     vec3 R = reflect(rd, n);
     R.y = abs(R.y);
@@ -895,7 +928,10 @@ void main() {
     float sh = terrShadow(p).r * cloudShadow(p);
     vec3 H = normalize(uSunDir - rd);
     float nh = max(dot(n, H), 0.0);
-    vec3 spec = uSunCol * sh * (pow(nh, 700.0) * 40.0 + pow(nh, 90.0) * 1.5) * F * 4.0;
+    /* the glint widens with distance (many waves per pixel) instead of
+     * breaking into sparkles */
+    float pw = mix(900.0, 90.0, smoothstep(40.0, 2500.0, dist));
+    vec3 spec = uSunCol * sh * (pow(nh, pw) * pw * 0.045 + pow(nh, 60.0) * 0.8) * F * 4.0;
     vec3 body = mix(vec3(0.015, 0.09, 0.085), vec3(0.003, 0.018, 0.03), 1.0 - exp(-depth / 20.0));
     body *= uAmbSky * 1.5 + uSunCol * max(uSunDir.y, 0.0) * 0.35 * sh;
     float aBody = 1.0 - exp(-depth / 3.5);
@@ -1174,7 +1210,7 @@ uniform sampler2D uReflD;      /* its view depth, half res */
  * there. rgb, a = confidence. */
 vec4 ssr(vec3 p, vec3 R) {
     vec4 c0 = uVP * vec4(p, 1.0), cr = uVP * vec4(R, 0.0);
-    float t = 8.0 * (1.0 + 0.6 * ign(gl_FragCoord.xy)), prev = 0.0;
+    float t = 8.0, prev = 0.0;
     for (int i = 0; i < 15; i++) {
         vec4 c = c0 + cr * t;
         if (c.w < 1.0) break;
@@ -1185,7 +1221,7 @@ vec4 ssr(vec3 p, vec3 R) {
             /* crossed behind the scene somewhere in this step: find where,
              * then it's a hit if that's the surface and not a gap behind it */
             float a = prev, b = t, gap = c.w - sd;
-            for (int k = 0; k < 5; k++) {
+            for (int k = 0; k < 7; k++) {
                 float m = 0.5 * (a + b);
                 vec4 cm = c0 + cr * m;
                 vec2 um = cm.xy / cm.w * 0.5 + 0.5;
@@ -1364,6 +1400,84 @@ static void equalize(float *v, int n, int stride, unsigned char *out, int ostrid
         out[i * ostride] = (unsigned char)(r * 255.0f / (n - 1) + 0.5f);
     }
     free(pairs);
+}
+
+/* Surface maps, tileable, 256^2, RG = slope (d/dx, d/dy, signed), B, A:
+ *  tex_wave:   water, a sum of sine waves (integer wave vectors, so it
+ *              tiles), mostly running with the wind; B = height
+ *  tex_detail: ground, ridged fbm (crisp crevices); A = height, B = a
+ *              softer fbm for colour
+ * Mipmapped: the slopes average away with distance instead of sparkling. */
+static GLuint tex_wave, tex_detail;
+static void pack_slopes(const float *h, int n, float *gx, float *gy) {
+    float gm = 1e-6f;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+            int i = y * n + x;
+            gx[i] = 0.5f * (h[y * n + ((x + 1) & (n - 1))] - h[y * n + ((x - 1) & (n - 1))]);
+            gy[i] = 0.5f * (h[((y + 1) & (n - 1)) * n + x] - h[((y - 1) & (n - 1)) * n + x]);
+            gm = fmaxf(gm, fmaxf(fabsf(gx[i]), fabsf(gy[i])));
+        }
+    for (int i = 0; i < n * n; i++) { gx[i] /= gm; gy[i] /= gm; }
+}
+static GLuint upload_rgba(const float *r, const float *g, const float *b, const float *a, int n) {
+    unsigned char *px = malloc((size_t)n * n * 4);
+    for (int i = 0; i < n * n; i++) {
+        px[4 * i + 0] = (unsigned char)lroundf((r[i] * 0.5f + 0.5f) * 255);
+        px[4 * i + 1] = (unsigned char)lroundf((g[i] * 0.5f + 0.5f) * 255);
+        px[4 * i + 2] = (unsigned char)lroundf(fminf(fmaxf(b[i], 0), 1) * 255);
+        px[4 * i + 3] = (unsigned char)lroundf(fminf(fmaxf(a[i], 0), 1) * 255);
+    }
+    GLuint t = mk_tex2d(GL_RGBA8, n, n, GL_RGBA, GL_UNSIGNED_BYTE, px, GL_LINEAR_MIPMAP_LINEAR, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
+    free(px);
+    return t;
+}
+static void norm01(float *v, int n) {
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < n; i++) { lo = fminf(lo, v[i]); hi = fmaxf(hi, v[i]); }
+    for (int i = 0; i < n; i++) v[i] = (v[i] - lo) / (hi - lo);
+}
+static void make_surface_maps(void) {
+    enum { N = 256, NW = 56 };
+    float *h = malloc(sizeof(float) * N * N), *h2 = malloc(sizeof(float) * N * N);
+    float *gx = malloc(sizeof(float) * N * N), *gy = malloc(sizeof(float) * N * N);
+    /* water: wave vectors k (cycles per tile) mostly along +x, amplitude
+     * falling as |k|^-1.6 like a wind-sea spectrum */
+    float kx[NW], ky[NW], am[NW], ph[NW];
+    for (int w = 0; w < NW; w++) {
+        float kk = 3 + 37 * powf(rand01(w, 0, 950), 1.5f);
+        float ang = (rand01(w, 1, 950) - 0.5f) * (rand01(w, 2, 950) < 0.8f ? 2.0f : 5.5f);
+        kx[w] = roundf(kk * cosf(ang)); ky[w] = roundf(kk * sinf(ang));
+        if (kx[w] == 0 && ky[w] == 0) kx[w] = 3;
+        am[w] = powf(sqrtf(kx[w] * kx[w] + ky[w] * ky[w]), -1.6f) * (0.5f + rand01(w, 3, 950));
+        ph[w] = rand01(w, 4, 950) * 6.2832f;
+    }
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            float v = 0;
+            for (int w = 0; w < NW; w++) v += am[w] * sinf(6.2832f * (kx[w] * x + ky[w] * y) / N + ph[w]);
+            h[y * N + x] = v;
+        }
+    pack_slopes(h, N, gx, gy);
+    norm01(h, N * N);
+    tex_wave = upload_rgba(gx, gy, h, h, N);
+    /* ground: ridged fbm for the crevices, a soft fbm for colour */
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            float s = 0, s2 = 0, amp = 0.5f;
+            for (int o = 0, p = 8; o < 5; o++, p *= 2, amp *= 0.5f) {
+                float r = 1 - fabsf(tile_vnoise((float)x / N * p, (float)y / N * p, p, 960 + o) * 2 - 1);
+                s += r * r * amp;
+                if (o < 3) s2 += tile_vnoise((float)x / N * p * 0.5f, (float)y / N * p * 0.5f, p / 2, 970 + o) * amp;
+            }
+            h[y * N + x] = s; h2[y * N + x] = s2;
+        }
+    pack_slopes(h, N, gx, gy);
+    norm01(h, N * N); norm01(h2, N * N);
+    tex_detail = upload_rgba(gx, gy, h2, h, N);
+    free(h); free(h2); free(gx); free(gy);
 }
 
 static void make_noise(void) {
@@ -1798,7 +1912,7 @@ static void mist_update(void) {
     float tx = (float)(fx - kx), tz = (float)(fz - kz);
     float a = mip6(kx, kz), b = mip6(kx + 1, kz), c = mip6(kx, kz + 1), d = mip6(kx + 1, kz + 1);
     float h = (a + (b - a) * tx) * (1 - tz) + (c + (d - c) * tx) * tz;
-    mist_top0 = fmaxf(h - 80, 5);
+    mist_top0 = h - 80;
 }
 static void set_common(GLuint p) {
     glUseProgram(p);
@@ -2404,11 +2518,16 @@ static void gl_init(void) {
     tex_shadow = mk_tex2d(GL_RG8, 1024, 1024, GL_RG, GL_UNSIGNED_BYTE, NULL, GL_LINEAR, GL_REPEAT);
     fbo_bake = mk_fbo(tex_shadow);
     make_noise();
+    make_surface_maps();
     GLuint units[5] = {hm[0].tex, hm[1].tex, tex_shadow, tex_noise2, tex_noise3};
     for (int i = 0; i < 5; i++) {
         glActiveTexture(GL_TEXTURE0 + i);
         glBindTexture(i == 4 ? GL_TEXTURE_3D : GL_TEXTURE_2D, units[i]);
     }
+    glActiveTexture(GL_TEXTURE14);
+    glBindTexture(GL_TEXTURE_2D, tex_wave);
+    glActiveTexture(GL_TEXTURE15);
+    glBindTexture(GL_TEXTURE_2D, tex_detail);
     glActiveTexture(GL_TEXTURE7);       /* scratch unit for uploads */
 
     GLuint vbo;
