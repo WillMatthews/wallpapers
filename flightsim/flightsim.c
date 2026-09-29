@@ -411,6 +411,7 @@ static GLuint program_full(const char *name, const char *vs, const char *tcs, co
     if ((l = glGetUniformLocation(p, "uSSR")) >= 0) glUniform1i(l, 13);
     if ((l = glGetUniformLocation(p, "uWave")) >= 0) glUniform1i(l, 14);
     if ((l = glGetUniformLocation(p, "uDetail")) >= 0) glUniform1i(l, 15);
+    if ((l = glGetUniformLocation(p, "uHistory")) >= 0) glUniform1i(l, 16);
     return p;
 }
 
@@ -437,6 +438,7 @@ uniform sampler2D uNoise2; uniform sampler3D uNoise3;
 uniform sampler2D uDetail;           /* ground detail: RG slope, B soft fbm, A ridged height */
 uniform vec2 uT0Cam; uniform vec2 uT1Cam;
 uniform float uPixAng;               /* radians per scene pixel */
+uniform vec2 uDitherOff;             /* shifts every frame, so TAA averages dithers into smooth blends */
 
 float hash12(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * .1031);
@@ -452,7 +454,7 @@ vec2 turn(vec2 w, vec2 m, float S) { return vec2(m.x * w.x + m.y * w.y, -m.y * w
 vec2 unturn(vec2 g, vec2 m) { return vec2(m.x * g.x - m.y * g.y, m.y * g.x + m.x * g.y) / length(m); }
 
 /* interleaved gradient noise: a jitter that tiles smoothly, unlike white noise */
-float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float ign(vec2 p) { p += uDitherOff; return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float hash13(vec3 p3) {
     p3 = fract(p3 * .1031);
     p3 += dot(p3, p3.zyx + 31.32);
@@ -1020,8 +1022,8 @@ void main() {
     /* the same a little toward the sun: a clump is lit on its sunny side */
     float clumpL = texture(uNoise3, q + uSunDir * 0.04).r;
     if (kDither) {
-        if (hash12(gl_FragCoord.xy) > vFade) discard;
-        if ((hash12(gl_FragCoord.xy + 17.0) < vLod) != (uFar == 1)) discard;
+        if (hash12(gl_FragCoord.xy + uDitherOff) > vFade) discard;
+        if ((hash12(gl_FragCoord.xy + uDitherOff + 17.0) < vLod) != (uFar == 1)) discard;
     }
     vec3 n = normalize(vN), cam = vec3(0.0, uCamY, 0.0);
     float dist = length(vRel - cam);
@@ -1182,11 +1184,23 @@ uniform vec2 uTexel; uniform float uExposure; uniform float uBloomAmt; uniform f
 uniform vec4 uVig;   /* this view in layout-normalised coords: x0, y0, w, h */
 out vec4 oCol;
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+/* Catmull-Rom upscale (5 taps, corners dropped): much crisper than bilinear */
+vec3 catmull(sampler2D t, vec2 uv) {
+    vec2 sz = vec2(textureSize(t, 0)), p = uv * sz - 0.5, c = floor(p) + 0.5, f = p - floor(p);
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2, t0 = (c - 1.0) / sz, t3 = (c + 2.0) / sz, t12 = (c + w2 / w12) / sz;
+    vec3 r = texture(t, vec2(t12.x, t0.y)).rgb * w12.x * w0.y + texture(t, vec2(t0.x, t12.y)).rgb * w0.x * w12.y +
+             texture(t, t12).rgb * w12.x * w12.y + texture(t, vec2(t3.x, t12.y)).rgb * w3.x * w12.y +
+             texture(t, vec2(t12.x, t3.y)).rgb * w12.x * w3.y;
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / wsum, vec3(0.0));
+}
 void main() {
-    vec3 c = texture(uSrc, vUV).rgb;
+    vec3 c = catmull(uSrc, vUV);
     if (uSharpen > 0.0) {
-        /* unsharp mask against a local blur: two bilinear taps half a texel
-         * off diagonally average the 3x3 neighbourhood */
+        /* and an unsharp mask to win back what TAA's jitter softens: two
+         * bilinear taps half a texel off diagonally average the 3x3 around */
         vec3 blur = 0.5 * (texture(uSrc, vUV + 0.5 * uTexel).rgb + texture(uSrc, vUV - 0.5 * uTexel).rgb);
         c = max(c + (c - blur) * 1.6 * uSharpen, vec3(0.0));
     }
@@ -1271,6 +1285,51 @@ void main() {
     vec3 R = reflect(rd, vec3(0.0, 1.0, 0.0));
     float F = 0.02 + 0.98 * pow(1.0 - max(-rd.y, 0.0), 5.0);
     if (F > 0.04) oCol = ssr(p, R);                     /* too faint to see otherwise */
+}
+);
+
+/* TAA resolve, at the scene's resolution: this frame's (jittered) sample
+ * blended into the history, reprojected through the depth (sky: by
+ * direction), read with Catmull-Rom so it stays sharp, and clamped to the
+ * current neighbourhood so nothing ghosts. Edges come out anti-aliased and
+ * dithered fades come out smooth. */
+static const char *FS_TAA = GLSL(
+in vec2 vUV;
+uniform sampler2D uSrc; uniform sampler2D uDepth; uniform sampler2D uHistory;
+uniform vec4 uViewTan; uniform mat3 uCamRot;   /* unjittered */
+uniform mat4 uPrevVP; uniform vec3 uCamDelta;  /* last frame's unjittered VP; camera travel since */
+uniform float uHistOK;
+out vec4 oCol;
+vec3 catmull(sampler2D t, vec2 uv) {
+    vec2 sz = vec2(textureSize(t, 0)), p = uv * sz - 0.5, c = floor(p) + 0.5, f = p - floor(p);
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2, t0 = (c - 1.0) / sz, t3 = (c + 2.0) / sz, t12 = (c + w2 / w12) / sz;
+    /* the 5 taps that carry nearly all the weight (corners dropped) */
+    vec3 r = texture(t, vec2(t12.x, t0.y)).rgb * w12.x * w0.y + texture(t, vec2(t0.x, t12.y)).rgb * w0.x * w12.y +
+             texture(t, t12).rgb * w12.x * w12.y + texture(t, vec2(t3.x, t12.y)).rgb * w3.x * w12.y +
+             texture(t, vec2(t12.x, t3.y)).rgb * w12.x * w3.y;
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / wsum, vec3(0.0));
+}
+void main() {
+    ivec2 ic = ivec2(gl_FragCoord.xy), sz = textureSize(uSrc, 0);
+    vec3 c = texelFetch(uSrc, ic, 0).rgb, mn = c, mx = c;
+    for (int i = 0; i < 4; i++) {
+        ivec2 o = i == 0 ? ivec2(1, 0) : i == 1 ? ivec2(-1, 0) : i == 2 ? ivec2(0, 1) : ivec2(0, -1);
+        vec3 q = texelFetch(uSrc, clamp(ic + o, ivec2(0), sz - 1), 0).rgb;
+        mn = min(mn, q); mx = max(mx, q);
+    }
+    if (uHistOK < 0.5) { oCol = vec4(c, 1.0); return; }
+    /* where this was last frame */
+    float d = texelFetch(uDepth, ic, 0).r;
+    vec3 v = vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0);
+    vec4 pc = d > 0.0 ? uPrevVP * vec4(uCamRot * (v * (1.5 / d)) + vec3(0.0, uCamY, 0.0) + uCamDelta, 1.0)
+                      : uPrevVP * vec4(uCamRot * v, 0.0);
+    vec2 pu = pc.xy / pc.w * 0.5 + 0.5;
+    if (pc.w <= 0.0 || any(lessThan(pu, vec2(0.0))) || any(greaterThan(pu, vec2(1.0)))) { oCol = vec4(c, 1.0); return; }
+    vec3 h = clamp(catmull(uHistory, pu), mn, mx);
+    oCol = vec4(mix(h, c, 0.12), 1.0);
 }
 );
 
@@ -1887,12 +1946,28 @@ static void cam_rot(float m[9]) {
 }
 
 static float view_tan[4], rot3[9], vp[16];
+/* TAA state (see render()) */
+static GLuint fbo_taa[2], tex_taa[2], p_taa;
+static int taa_w, taa_h, taa_cur, taa_hist;
+static float taa_jx, taa_jy;
+static unsigned taa_frame;
 
-static void setup_matrices(void) {
+static float vp_nj[16], view_tan_nj[4];      /* the same without the TAA jitter */
+static void build_vp(float l, float r, float b, float t, float *out);
+/* jx, jy: this frame's TAA jitter, in scene pixels over a scene sw x sh */
+static void setup_matrices(float jx, float jy, int sw, int sh) {
     float l = (view_x - cam_cx) / cam_f, r = (view_x + view_w - cam_cx) / cam_f;
     float b = (cam_cy - view_y - view_h) / cam_f, t = (cam_cy - view_y) / cam_f;
-    view_tan[0] = l; view_tan[1] = b; view_tan[2] = r - l; view_tan[3] = t - b;
     cam_rot(rot3);
+    view_tan_nj[0] = l; view_tan_nj[1] = b; view_tan_nj[2] = r - l; view_tan_nj[3] = t - b;
+    build_vp(l, r, b, t, vp_nj);
+    /* shifting the frustum by +j pixels moves the image by -j */
+    float ox = jx * (r - l) / sw, oy = jy * (t - b) / sh;
+    l += ox; r += ox; b += oy; t += oy;
+    view_tan[0] = l; view_tan[1] = b; view_tan[2] = r - l; view_tan[3] = t - b;
+    build_vp(l, r, b, t, vp);
+}
+static void build_vp(float l, float r, float b, float t, float *out) {
     /* view = R^T * translate(0, -camY, 0); reversed-Z infinite projection */
     float V[16] = {0};
     for (int c = 0; c < 3; c++)
@@ -1905,8 +1980,8 @@ static void setup_matrices(void) {
     P[14] = n; P[11] = -1;
     for (int c = 0; c < 4; c++)
         for (int rr = 0; rr < 4; rr++) {
-            vp[c * 4 + rr] = 0;
-            for (int k = 0; k < 4; k++) vp[c * 4 + rr] += P[k * 4 + rr] * V[c * 4 + k];
+            out[c * 4 + rr] = 0;
+            for (int k = 0; k < 4; k++) out[c * 4 + rr] += P[k * 4 + rr] * V[c * 4 + k];
         }
 }
 
@@ -1966,6 +2041,7 @@ static void set_common(GLuint p) {
     glUniform2f(UL(p, "uT0Cam"), (float)fmod(fl.x / BASE, 1024.0), (float)fmod(fl.z / BASE, 1024.0));
     glUniform2f(UL(p, "uT1Cam"), (float)fmod(fl.x / (4 * BASE), 1024.0), (float)fmod(fl.z / (4 * BASE), 1024.0));
     glUniform1f(UL(p, "uPixAng"), pix_ang);
+    glUniform2f(UL(p, "uDitherOff"), (float)(taa_frame % 16) * 37.0f, (float)(taa_frame % 16) * 17.0f);
     glUniformMatrix4fv(UL(p, "uVP"), 1, GL_FALSE, vp);
 }
 
@@ -2217,8 +2293,59 @@ static float draw_shafts(void) {
     return amt;
 }
 
+/* --bench: GPU time per pass, from timestamps between them */
+enum { PR_BAKE, PR_CLOUD, PR_TREE, PR_TERR, PR_SKY, PR_WATER, PR_TAA, PR_POST, PR_N };
+static const char *prof_name[PR_N] = {"bake", "clouds", "trees", "terrain", "sky", "water", "taa", "post"};
+static GLuint prof_q[PR_N + 1];
+static double prof_ms[PR_N];
+static int prof_on;
+static void prof_mark(int i) { if (prof_on) glQueryCounter(prof_q[i], GL_TIMESTAMP); }
+static void taa_resolve(void) {
+    static float prev_vp[16];
+    static double prev_x, prev_z;
+    GLuint old_tex = 0, old_fbo = 0;
+    if (taa_w != scene_w || taa_h != scene_h) {
+        /* new size (dynamic resolution): the history is read by uv, so the
+         * old one still serves this frame; then it goes */
+        if (tex_taa[0]) {
+            old_tex = tex_taa[!taa_cur]; old_fbo = fbo_taa[!taa_cur];
+            glDeleteTextures(1, &tex_taa[taa_cur]); glDeleteFramebuffers(1, &fbo_taa[taa_cur]);
+        }
+        for (int i = 0; i < 2; i++) {
+            tex_taa[i] = mk_tex2d(GL_R11F_G11F_B10F, scene_w, scene_h, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            fbo_taa[i] = mk_fbo(tex_taa[i]);
+        }
+        taa_w = scene_w; taa_h = scene_h;
+    }
+    double jump = fabs(prev_x - fl.x) + fabs(prev_z - fl.z);
+    GLuint hist = old_tex ? old_tex : tex_taa[!taa_cur];
+    taa_cur ^= 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_taa[taa_cur]);
+    glViewport(0, 0, scene_w, scene_h);
+    set_common(p_taa);
+    glUniform4fv(UL(p_taa, "uViewTan"), 1, view_tan_nj);
+    glUniformMatrix3fv(UL(p_taa, "uCamRot"), 1, GL_FALSE, rot3);
+    glUniformMatrix4fv(UL(p_taa, "uPrevVP"), 1, GL_FALSE, prev_vp);
+    glUniform3f(UL(p_taa, "uCamDelta"), (float)(fl.x - prev_x), 0.0f, (float)(fl.z - prev_z));
+    glUniform1f(UL(p_taa, "uHistOK"), taa_hist && jump < 200 ? 1.0f : 0.0f);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, tex_scene);
+    glActiveTexture(GL_TEXTURE9);
+    glBindTexture(GL_TEXTURE_2D, tex_depth);
+    glActiveTexture(GL_TEXTURE16);
+    glBindTexture(GL_TEXTURE_2D, hist);
+    glActiveTexture(GL_TEXTURE7);
+    fullscreen();
+    if (old_tex) { glDeleteTextures(1, &old_tex); glDeleteFramebuffers(1, &old_fbo); }
+    memcpy(prev_vp, vp_nj, sizeof prev_vp);
+    prev_x = fl.x; prev_z = fl.z;
+    taa_hist = 1;
+}
+
 static void post(GLuint target) {
     glDisable(GL_DEPTH_TEST);
+    taa_resolve();
+    prof_mark(PR_POST);
     float shaft_amt = draw_shafts();
     /* bloom: soft-threshold downsample chain, then tent upsample back */
     glUseProgram(p_down);
@@ -2248,7 +2375,7 @@ static void post(GLuint target) {
     glViewport(0, 0, W, H);
     glUseProgram(p_post);
     glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_2D, tex_scene);
+    glBindTexture(GL_TEXTURE_2D, tex_taa[taa_cur]);
     glActiveTexture(GL_TEXTURE6);
     glBindTexture(GL_TEXTURE_2D, tex_bloom[0]);
     glActiveTexture(GL_TEXTURE7);       /* scratch unit for uploads */
@@ -2257,7 +2384,7 @@ static void post(GLuint target) {
     glUniform1f(UL(p_post, "uBloomAmt"), 0.06f);
     glUniform1f(UL(p_post, "uShaftAmt"), shaft_amt);
     glUniform1f(UL(p_post, "uSat"), pal.sat);
-    glUniform1f(UL(p_post, "uSharpen"), scene_w < W ? 0.5f : 0.0f);
+    glUniform1f(UL(p_post, "uSharpen"), 0.55f);
     glUniform4f(UL(p_post, "uVig"), (view_x - lay_x0) / lay_w, (lay_y0 + lay_h - view_y - view_h) / lay_h, view_w / lay_w, view_h / lay_h);
     fullscreen();
 }
@@ -2403,13 +2530,6 @@ static void draw_clouds(void) {
     cloud_hist = 1;
 }
 
-/* --bench: GPU time per pass, from timestamps between them */
-enum { PR_BAKE, PR_CLOUD, PR_TREE, PR_TERR, PR_SKY, PR_WATER, PR_POST, PR_N };
-static const char *prof_name[PR_N] = {"bake", "clouds", "trees", "terrain", "sky", "water", "post"};
-static GLuint prof_q[PR_N + 1];
-static double prof_ms[PR_N];
-static int prof_on;
-static void prof_mark(int i) { if (prof_on) glQueryCounter(prof_q[i], GL_TIMESTAMP); }
 static void prof_collect(void) {
     if (!prof_on) return;
     GLuint64 t[PR_N + 1];
@@ -2417,9 +2537,22 @@ static void prof_collect(void) {
     for (int i = 0; i < PR_N; i++) prof_ms[i] += (t[i + 1] - t[i]) * 1e-6;
 }
 
+/* Temporal upscaling: each frame renders the scene shifted by a different
+ * sub-pixel offset (Halton 2,3), and FS_TAA folds it into a full-res history
+ * reprojected through the depth, so detail builds up over a few frames. */
+static float halton(int i, int b) {
+    float f = 1, r = 0;
+    for (; i > 0; i /= b) { f /= b; r += f * (i % b); }
+    return r;
+}
+
 static void render(GLuint target) {
     setup_view();
-    setup_matrices();
+    int sw0 = (int)(W * render_scale + 0.5f), sh0 = (int)(H * render_scale + 0.5f);
+    sw0 = sw0 < 16 ? 16 : sw0; sh0 = sh0 < 16 ? 16 : sh0;
+    int ph = (int)(taa_frame++ % 8) + 1;
+    taa_jx = halton(ph, 2) - 0.5f; taa_jy = halton(ph, 3) - 0.5f;
+    setup_matrices(taa_jx, taa_jy, sw0, sh0);
     hm_update(&hm[0], fl.x, fl.z);
     hm_update(&hm[1], fl.x, fl.z);
     if (opt_trees) trees_update();
@@ -2428,8 +2561,7 @@ static void render(GLuint target) {
     prof_mark(PR_BAKE);
     bake_step();
 
-    int sw = (int)(W * render_scale + 0.5f), sh = (int)(H * render_scale + 0.5f);
-    resize_scene(sw < 16 ? 16 : sw, sh < 16 ? 16 : sh);
+    resize_scene(sw0, sh0);
     pix_ang = 1.0f / (cam_f * render_scale);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene);
     glViewport(0, 0, scene_w, scene_h);
@@ -2495,7 +2627,7 @@ static void render(GLuint target) {
 
     glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     glDepthFunc(GL_LESS);
-    prof_mark(PR_POST);
+    prof_mark(PR_TAA);
     post(target);
     if (opt_hud) draw_hud();
     prof_mark(PR_N);
@@ -2514,6 +2646,7 @@ static void gl_init(void) {
     p_shaft_mask = program("shaft mask", VS_FULL, FS_SHAFT_MASK);
     p_reflsrc = program("reflection source", VS_FULL, FS_REFLSRC);
     p_ssr = program("water reflections", VS_FULL, FS_SSR);
+    p_taa = program("taa", VS_FULL, FS_TAA);
     p_shaft_blur = program("shaft blur", VS_FULL, FS_SHAFT_BLUR);
     p_terr = program_tess("terrain", VS_TERRAIN, TCS_TERRAIN, TES_TERRAIN, FS_TERRAIN);
     patch_init();
