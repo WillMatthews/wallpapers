@@ -406,6 +406,9 @@ static GLuint program_full(const char *name, const char *vs, const char *tcs, co
     if (l >= 0) glUniform1i(l, 8);
     if ((l = glGetUniformLocation(p, "uDepth")) >= 0) glUniform1i(l, 9);
     if ((l = glGetUniformLocation(p, "uShaft")) >= 0) glUniform1i(l, 10);
+    if ((l = glGetUniformLocation(p, "uRefl")) >= 0) glUniform1i(l, 11);
+    if ((l = glGetUniformLocation(p, "uReflD")) >= 0) glUniform1i(l, 12);
+    if ((l = glGetUniformLocation(p, "uSSR")) >= 0) glUniform1i(l, 13);
     return p;
 }
 
@@ -835,6 +838,8 @@ void main() {
 static const char *FS_WATER = GLSL(
 in vec3 vRel;
 out vec4 oCol;
+uniform sampler2D uSSR;        /* reflections off flat water, half res (FS_SSR) */
+uniform vec2 uSceneSize;
 float wav(vec2 w, float s, vec2 v) { return texture(uNoise2, w / s + v * uTime / s).b; }
 void main() {
     vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
@@ -868,6 +873,10 @@ void main() {
         float c = smoothstep(0.05, 0.45, cloudCov(q)) * smoothstep(0.0, 0.08, R.y);
         refl = mix(refl, uAmbSky * 1.4 + uSunCol * 0.25 * max(uSunDir.y, 0.1), c * 0.85);
     }
+    /* mountains and trees on screen reflect; the sky above stays the fallback */
+    /* traced for flat water; the waves wobble where it's read */
+    vec4 sr = texture(uSSR, gl_FragCoord.xy / uSceneSize + n.xz * vec2(0.03, -0.03));
+    refl = mix(refl, sr.rgb, sr.a);
     float sh = terrShadow(p).r * cloudShadow(p);
     vec3 H = normalize(uSunDir - rd);
     float nh = max(dot(n, H), 0.0);
@@ -1116,6 +1125,77 @@ void main() {
 }
 );
 
+/* The scene so far, at half res, with its view depth in alpha, for the
+ * water's reflections (read from a copy: the water draws into the scene) */
+static const char *FS_REFLSRC = GLSL(
+in vec2 vUV;
+uniform sampler2D uSrc; uniform sampler2D uDepth;
+layout(location = 0) out vec4 oCol;
+layout(location = 1) out float oDepth;
+void main() {
+    float d = textureLod(uDepth, vUV, 0.0).r;
+    oCol = vec4(textureLod(uSrc, vUV, 0.0).rgb, 1.0);
+    oDepth = d > 0.0 ? min(1.5 / d, 1e5) : 1e5;         /* reversed-Z: near plane 1.5 */
+}
+);
+
+/* Reflections of the scene in the water, traced for a flat surface at half
+ * res: each pixel's ray meets the water plane, and if water shows there the
+ * reflected ray is marched through the scene's depth. */
+static const char *FS_SSR = GLSL(
+in vec2 vUV;
+uniform vec4 uViewTan; uniform mat3 uCamRot; uniform mat4 uVP;
+uniform sampler2D uRefl;       /* the scene so far, half res */
+uniform sampler2D uReflD;      /* its view depth, half res */
+/* Screen-space reflection: march the reflected ray, projecting as it goes
+ * (clip position is linear in t), until it passes behind what the scene drew
+ * there. rgb, a = confidence. */
+vec4 ssr(vec3 p, vec3 R) {
+    vec4 c0 = uVP * vec4(p, 1.0), cr = uVP * vec4(R, 0.0);
+    float t = 8.0 * (1.0 + 0.6 * ign(gl_FragCoord.xy)), prev = 0.0;
+    for (int i = 0; i < 15; i++) {
+        vec4 c = c0 + cr * t;
+        if (c.w < 1.0) break;
+        vec2 uv = c.xy / c.w * 0.5 + 0.5;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
+        float sd = textureLod(uReflD, uv, 0.0).r;
+        if (c.w > sd) {
+            /* crossed behind the scene somewhere in this step: find where,
+             * then it's a hit if that's the surface and not a gap behind it */
+            float a = prev, b = t, gap = c.w - sd;
+            for (int k = 0; k < 5; k++) {
+                float m = 0.5 * (a + b);
+                vec4 cm = c0 + cr * m;
+                vec2 um = cm.xy / cm.w * 0.5 + 0.5;
+                float dm = textureLod(uReflD, um, 0.0).r;
+                if (cm.w > dm) { b = m; uv = um; gap = cm.w - dm; } else a = m;
+            }
+            if (gap > max(30.0, 0.05 * t)) break;
+            float edge = smoothstep(0.0, 0.1, min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)));
+            return vec4(textureLod(uRefl, uv, 0.0).rgb, edge);
+        }
+        prev = t;
+        t *= 1.6;
+    }
+    return vec4(0.0);
+}
+out vec4 oCol;
+void main() {
+    oCol = vec4(0.0);
+    vec3 v = vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0);
+    vec3 rd = normalize(uCamRot * v);
+    if (rd.y > -0.002) return;
+    float t = uCamY / -rd.y;
+    /* view depth of the water there vs what's drawn: land in front hides it */
+    if (t / length(v) > textureLod(uReflD, vUV, 0.0).r) return;
+    vec3 p = rd * t;
+    p.y = 0.0;
+    vec3 R = reflect(rd, vec3(0.0, 1.0, 0.0));
+    float F = 0.02 + 0.98 * pow(1.0 - max(-rd.y, 0.0), 5.0);
+    if (F > 0.04) oCol = ssr(p, R);                     /* too faint to see otherwise */
+}
+);
+
 /* Light shafts. The mask: sky seen near the sun, dimmed by cloud in front
  * of it (depth 0 is the far plane: nothing drawn there). */
 static const char *FS_SHAFT_MASK = GLSL(
@@ -1157,12 +1237,14 @@ void main() {
 );
 
 /* ---- GL state ---- */
-static GLuint p_shaft_mask, p_shaft_blur, p_sky, p_cloud, p_tree_solid, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
+static GLuint p_ssr, p_reflsrc, p_shaft_mask, p_shaft_blur, p_sky, p_cloud, p_tree_solid, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
 static GLuint vao_empty, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3;
 #define FOG_FAR 14000.0f
 
 /* offscreen targets */
 static GLuint fbo_scene, tex_scene, tex_depth, fbo_final, tex_final;
+static GLuint fbo_refl, tex_refl, tex_refl_d;
+static GLuint fbo_ssr, tex_ssr;                /* the water's reflections, half res */              /* half res copy of the scene for the water to reflect */
 static GLuint fbo_shaft[2], tex_shaft[2];     /* light shafts at quarter res: the mask, then its radial blur */
 static int shaft_w, shaft_h;
 static GLuint fbo_cloud[2], tex_cloud[2];     /* sky clouds at half res, this frame's and last's (ping-pong) */
@@ -1198,6 +1280,8 @@ static void resize_scene(int w, int h) {
     if (tex_scene) {
         glDeleteTextures(1, &tex_scene); glDeleteTextures(1, &tex_depth); glDeleteFramebuffers(1, &fbo_scene);
         glDeleteTextures(2, tex_shaft); glDeleteFramebuffers(2, fbo_shaft);
+        glDeleteTextures(1, &tex_refl); glDeleteTextures(1, &tex_refl_d); glDeleteFramebuffers(1, &fbo_refl);
+        glDeleteTextures(1, &tex_ssr); glDeleteFramebuffers(1, &fbo_ssr);
         glDeleteTextures(NBLOOM, tex_bloom); glDeleteFramebuffers(NBLOOM, fbo_bloom);
         glDeleteTextures(2, tex_cloud); glDeleteFramebuffers(2, fbo_cloud);
     }
@@ -1212,6 +1296,14 @@ static void resize_scene(int w, int h) {
     tex_depth = mk_tex2d(GL_DEPTH_COMPONENT32F, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
     fbo_scene = mk_fbo(tex_scene);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, tex_depth, 0);
+    tex_refl = mk_tex2d(GL_R11F_G11F_B10F, (w + 1) / 2, (h + 1) / 2, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+    tex_refl_d = mk_tex2d(GL_R32F, (w + 1) / 2, (h + 1) / 2, GL_RED, GL_FLOAT, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    fbo_refl = mk_fbo(tex_refl);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex_refl_d, 0);
+    static const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glDrawBuffers(2, bufs);
+    tex_ssr = mk_tex2d(GL_RGBA16F, (w + 1) / 2, (h + 1) / 2, GL_RGBA, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+    fbo_ssr = mk_fbo(tex_ssr);
     shaft_w = (w + 3) / 4; shaft_h = (h + 3) / 4;
     for (int i = 0; i < 2; i++) {
         tex_shaft[i] = mk_tex2d(GL_R11F_G11F_B10F, shaft_w, shaft_h, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
@@ -1780,6 +1872,7 @@ static void draw_trees(void) {
 
 static void draw_water(void) {
     set_common(p_water);
+    glUniform2f(UL(p_water, "uSceneSize"), (float)scene_w, (float)scene_h);
     glUniform1f(UL(p_water, "uExtent"), FOG_FAR);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -2175,6 +2268,31 @@ static void render(GLuint target) {
     glDepthMask(GL_TRUE);
 
     prof_mark(PR_WATER);
+    /* what the water reflects: the scene so far, at half res */
+    glDisable(GL_DEPTH_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_refl);
+    glViewport(0, 0, (scene_w + 1) / 2, (scene_h + 1) / 2);
+    glUseProgram(p_reflsrc);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, tex_scene);
+    glActiveTexture(GL_TEXTURE9);
+    glBindTexture(GL_TEXTURE_2D, tex_depth);
+    fullscreen();
+    glActiveTexture(GL_TEXTURE11);
+    glBindTexture(GL_TEXTURE_2D, tex_refl);
+    glActiveTexture(GL_TEXTURE12);
+    glBindTexture(GL_TEXTURE_2D, tex_refl_d);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_ssr);
+    set_common(p_ssr);
+    glUniform4fv(UL(p_ssr, "uViewTan"), 1, view_tan);
+    glUniformMatrix3fv(UL(p_ssr, "uCamRot"), 1, GL_FALSE, rot3);
+    fullscreen();
+    glActiveTexture(GL_TEXTURE13);
+    glBindTexture(GL_TEXTURE_2D, tex_ssr);
+    glActiveTexture(GL_TEXTURE7);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene);
+    glViewport(0, 0, scene_w, scene_h);
+    glEnable(GL_DEPTH_TEST);
     draw_water();
 
     glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
@@ -2196,6 +2314,8 @@ static void gl_init(void) {
     p_sky = program("sky", VS_FULL, FS_SKY);
     p_cloud = program("cloud", VS_FULL, FS_CLOUD);
     p_shaft_mask = program("shaft mask", VS_FULL, FS_SHAFT_MASK);
+    p_reflsrc = program("reflection source", VS_FULL, FS_REFLSRC);
+    p_ssr = program("water reflections", VS_FULL, FS_SSR);
     p_shaft_blur = program("shaft blur", VS_FULL, FS_SHAFT_BLUR);
     p_terr = program_tess("terrain", VS_TERRAIN, TCS_TERRAIN, TES_TERRAIN, FS_TERRAIN);
     patch_init();
