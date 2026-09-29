@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Lock-screen background for swaylock-plugin --command-each (one instance per
-# output). Runs a screensaver on the root window of a private Xwayland, which
-# windowtolayer turns into a layer surface behind the password ring.
+# output). flightsim draws its own layer surface; pipes and maze run on the
+# root window of a private Xwayland, which windowtolayer turns into a layer
+# surface behind the password ring.
 # Usage: lock-bg.sh [pipes|maze|flightsim] [seed] [epoch]   (default: random)
 # With no args it reads "saver seed epoch" from $XDG_RUNTIME_DIR/lock-bg.cur,
 # which lock.sh and lock-next.sh write; swaylock-plugin re-runs this same
@@ -16,7 +17,7 @@ case $pick in
   pipes)     cmd=("$dir/pipes/bin/pipes" --root --delay 5000) ;;
   maze)      cmd=("$dir/maze3d/bin/maze3d" --root) ;;
   flightsim)
-    cmd=("$dir/flightsim/flightsim" --root)
+    cmd=("$dir/flightsim/flightsim" --layer)
     [[ -n ${2:-} ]] && cmd+=(--seed "$2")
     [[ -n ${3:-} ]] && cmd+=(--epoch "$3")
     # "x,y,w,h;..." of the active outputs, and our index in it
@@ -29,5 +30,9 @@ case $pick in
     fi ;;
   *) echo "lock-bg.sh: unknown screensaver '$pick'" >&2; exit 1 ;;
 esac
+# flightsim is a native Wayland layer-shell client; the others are X11
+# hacks, run on the root window of a private Xwayland that windowtolayer turns
+# into a layer surface (that path tears under load, hence flightsim's own)
+if [[ $pick == flightsim ]]; then exec "${cmd[@]}"; fi
 exec "$dir/build/windowtolayer/target/release/windowtolayer" \
   "$dir/build/swaylock-plugin/example_xwayland_wrapper.py" "${cmd[@]}"

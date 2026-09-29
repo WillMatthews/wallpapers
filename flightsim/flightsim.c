@@ -10,7 +10,9 @@
  *
  * Plain Xlib + GLX (GL 4.5 compatibility context), like the xscreensaver
  * hacks, so it runs the same way: --window, or --root (a full-size child of
- * the root window, which is what the swaylock-plugin / Xwayland chain needs).
+ * the root window). --layer instead is a native Wayland wallpaper (a
+ * wlr-layer-shell surface over EGL), which is what swaylock-plugin runs on
+ * the lock screen: going through a rootful Xwayland there tore.
  * The scene renders at a dynamic resolution that tracks the frame budget, so
  * several instances can share a small iGPU.
  *
@@ -38,11 +40,17 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <poll.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <wayland-client.h>
+#include <wayland-egl.h>
+#include "proto-layer-shell.h"
 
 #define DEG (180.0f / (float)M_PI)
 
 /* ---- options ---- */
-static int opt_root = 0, opt_hud = 1;
+static int opt_root = 0, opt_hud = 1, opt_layer = 0;
 static float opt_speed = 1.0f, opt_fov = 60.0f, opt_scale = 0;   /* 0 = dynamic */
 static const char *opt_time = "random";
 static uint32_t opt_seed = 0;
@@ -453,6 +461,14 @@ vec2 turn(vec2 w, vec2 m, float S) { return vec2(m.x * w.x + m.y * w.y, -m.y * w
 /* a slope read in turned texture space, back into world axes */
 vec2 unturn(vec2 g, vec2 m) { return vec2(m.x * g.x - m.y * g.y, m.y * g.x + m.x * g.y) / length(m); }
 
+/* The HDR buffers are R11G11B10 floats: 5-6 bit mantissas, which band a
+ * smooth sky into faint lines along the horizon (they sweep across as the
+ * view pitches). A +-half-step dither before storing, reshuffled every frame
+ * and averaged by the TAA, turns the steps into a smooth gradient. */
+vec3 hdrDither(vec3 c, vec2 fc) {
+    float n = fract(52.9829189 * fract(dot(fc + uDitherOff * 1.37, vec2(0.06711056, 0.00583715)))) - 0.5;
+    return c * (1.0 + n * 0.035);
+}
 /* interleaved gradient noise: a jitter that tiles smoothly, unlike white noise */
 float ign(vec2 p) { p += uDitherOff; return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float hash13(vec3 p3) {
@@ -685,7 +701,7 @@ void main() {
     vec3 col = skyBase(rd) + sunDisc(rd) + stars(rd);
     col = applyMist(col, rd, uFogFar, 1.0);
     vec4 c = uCloudsOn > 0.5 ? texture(uCloudTex, vUV) : vec4(0.0, 0.0, 0.0, 1.0);
-    oCol = vec4(col * c.a + c.rgb, 1.0);
+    oCol = vec4(hdrDither(col * c.a + c.rgb, gl_FragCoord.xy), 1.0);
 }
 );
 
@@ -888,7 +904,7 @@ void main() {
     vec3 lit = col * (uSunCol * diff * sh + amb);
     vec3 H = normalize(uSunDir - rd);
     lit += uSunCol * snowAmt * sh * pow(max(dot(n, H), 0.0), 40.0) * 0.25;
-    oCol = vec4(atmos(lit, rd, dist, 10, ign(gl_FragCoord.xy)), 1.0);
+    oCol = vec4(hdrDither(atmos(lit, rd, dist, 10, ign(gl_FragCoord.xy)), gl_FragCoord.xy), 1.0);
 }
 );
 
@@ -1329,7 +1345,7 @@ void main() {
     vec2 pu = pc.xy / pc.w * 0.5 + 0.5;
     if (pc.w <= 0.0 || any(lessThan(pu, vec2(0.0))) || any(greaterThan(pu, vec2(1.0)))) { oCol = vec4(c, 1.0); return; }
     vec3 h = clamp(catmull(uHistory, pu), mn, mx);
-    oCol = vec4(mix(h, c, 0.12), 1.0);
+    oCol = vec4(hdrDither(mix(h, c, 0.12), gl_FragCoord.xy + 71.0), 1.0);   /* the history is R11G11B10 too */
 }
 );
 
@@ -2746,9 +2762,99 @@ static void parse_layout(const char *str) {
     }
 }
 
+/* ---- --layer: a native Wayland wallpaper (wlr-layer-shell + EGL) ---- */
+static struct {
+    struct wl_display *d;
+    struct wl_compositor *comp;
+    struct zwlr_layer_shell_v1 *shell;
+    struct wl_surface *surf;
+    struct zwlr_layer_surface_v1 *ls;
+    struct wl_egl_window *ew;
+    EGLDisplay ed;
+    EGLSurface es;
+    int configured, closed;
+} wl;
+
+static void wl_global(void *data, struct wl_registry *r, uint32_t name, const char *intf, uint32_t ver) {
+    (void)data;
+    if (!strcmp(intf, wl_compositor_interface.name))
+        wl.comp = wl_registry_bind(r, name, &wl_compositor_interface, ver < 4 ? ver : 4);
+    else if (!strcmp(intf, zwlr_layer_shell_v1_interface.name))
+        wl.shell = wl_registry_bind(r, name, &zwlr_layer_shell_v1_interface, ver < 4 ? ver : 4);
+}
+static void wl_global_remove(void *data, struct wl_registry *r, uint32_t name) { (void)data; (void)r; (void)name; }
+static const struct wl_registry_listener wl_reg_l = {wl_global, wl_global_remove};
+
+static void ls_configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t serial, uint32_t w, uint32_t h) {
+    (void)data;
+    zwlr_layer_surface_v1_ack_configure(ls, serial);
+    if (w && h && ((int)w != W || (int)h != H)) {
+        W = (int)w; H = (int)h;
+        if (wl.ew) wl_egl_window_resize(wl.ew, W, H, 0, 0);
+    }
+    wl.configured = 1;
+}
+static void ls_closed(void *data, struct zwlr_layer_surface_v1 *ls) { (void)data; (void)ls; wl.closed = 1; }
+static const struct zwlr_layer_surface_v1_listener ls_l = {ls_configure, ls_closed};
+
+static void wl_die(const char *what) { fprintf(stderr, "flightsim: %s\n", what); exit(1); }
+
+/* a background layer over the whole output (the lock screen's, under
+ * swaylock-plugin), with a GL 4.5 compatibility context on it */
+static void wl_init(void) {
+    if (!(wl.d = wl_display_connect(NULL))) wl_die("can't connect to the Wayland display");
+    struct wl_registry *reg = wl_display_get_registry(wl.d);
+    wl_registry_add_listener(reg, &wl_reg_l, NULL);
+    wl_display_roundtrip(wl.d);
+    if (!wl.comp || !wl.shell) wl_die("the compositor has no wlr-layer-shell");
+    wl.surf = wl_compositor_create_surface(wl.comp);
+    wl.ls = zwlr_layer_shell_v1_get_layer_surface(wl.shell, wl.surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "flightsim");
+    zwlr_layer_surface_v1_add_listener(wl.ls, &ls_l, NULL);
+    zwlr_layer_surface_v1_set_anchor(wl.ls, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    zwlr_layer_surface_v1_set_exclusive_zone(wl.ls, -1);
+    zwlr_layer_surface_v1_set_size(wl.ls, 0, 0);
+    /* no input: it's a picture */
+    struct wl_region *none = wl_compositor_create_region(wl.comp);
+    wl_surface_set_input_region(wl.surf, none);
+    wl_region_destroy(none);
+    wl_surface_commit(wl.surf);
+    while (!wl.configured && !wl.closed && wl_display_dispatch(wl.d) >= 0) {}
+    if (!wl.configured) wl_die("the layer surface was never configured");
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_disp = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    wl.ed = get_disp ? get_disp(EGL_PLATFORM_WAYLAND_KHR, wl.d, NULL) : eglGetDisplay((EGLNativeDisplayType)wl.d);
+    if (!eglInitialize(wl.ed, NULL, NULL)) wl_die("eglInitialize failed");
+    eglBindAPI(EGL_OPENGL_API);
+    static const EGLint cfg_attr[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+                                      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 0, EGL_NONE};
+    EGLConfig cfg;
+    EGLint n = 0;
+    if (!eglChooseConfig(wl.ed, cfg_attr, &cfg, 1, &n) || n < 1) wl_die("no suitable EGL config");
+    static const EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 5,
+                                      EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT, EGL_NONE};
+    EGLContext ctx = eglCreateContext(wl.ed, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (ctx == EGL_NO_CONTEXT) wl_die("can't create a GL 4.5 context");
+    wl.ew = wl_egl_window_create(wl.surf, W, H);
+    wl.es = eglCreateWindowSurface(wl.ed, cfg, (EGLNativeWindowType)wl.ew, NULL);
+    if (wl.es == EGL_NO_SURFACE || !eglMakeCurrent(wl.ed, wl.es, wl.es, ctx)) wl_die("can't make the EGL surface current");
+    eglSwapInterval(wl.ed, 1);                 /* in step with the display: no tearing */
+}
+
+/* handle whatever the compositor sent, without blocking; 0 once we're closed */
+static int wl_poll(void) {
+    while (wl_display_prepare_read(wl.d) != 0) wl_display_dispatch_pending(wl.d);
+    wl_display_flush(wl.d);
+    struct pollfd pf = {wl_display_get_fd(wl.d), POLLIN, 0};
+    if (poll(&pf, 1, 0) > 0) wl_display_read_events(wl.d);
+    else wl_display_cancel_read(wl.d);
+    if (wl_display_dispatch_pending(wl.d) < 0) return 0;
+    return !wl.closed;
+}
+
 static void usage(void) {
     fprintf(stderr,
-        "usage: flightsim [--window | --root] [--no-hud] [--no-trees] [--no-clouds]\n"
+        "usage: flightsim [--window | --root | --layer] [--no-hud] [--no-trees] [--no-clouds]\n"
         "                 [--time day|golden|dusk|night|random]\n"
         "                 [--speed X] [--fov DEG] [--seed N] [--epoch UNIXTIME]\n"
         "                 [--scale X]   (fixed render scale; default adapts to the frame budget)\n"
@@ -2787,6 +2893,7 @@ int main(int argc, char **argv) {
         if (a[0] == '-' && a[1] == '-') a++;                /* accept -x and --x */
         if (!strcmp(a, "-root")) opt_root = 1;
         else if (!strcmp(a, "-window")) opt_root = 0;
+        else if (!strcmp(a, "-layer")) opt_layer = 1;
         else if (!strcmp(a, "-no-hud")) opt_hud = 0;
         else if (!strcmp(a, "-hud")) opt_hud = 1;
         else if (!strcmp(a, "-no-trees")) opt_trees = 0;
@@ -2815,33 +2922,39 @@ int main(int argc, char **argv) {
     nthreads = nc > 1 ? (int)nc : 1;
     if (!offscreen && nthreads > 8) nthreads = 8;   /* be polite when there are several of us */
 
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) { fprintf(stderr, "flightsim: can't open display\n"); return 1; }
-    int scr = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, scr);
-    int attrs[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
-    XVisualInfo *vi = glXChooseVisual(dpy, scr, attrs);
-    if (!vi) { fprintf(stderr, "flightsim: no suitable GLX visual\n"); return 1; }
+    Display *dpy = NULL;
+    Window root = 0, win = 0;
+    Atom wm_delete = 0;
+    if (opt_layer && !offscreen) wl_init();
+    else {
+        dpy = XOpenDisplay(NULL);
+        if (!dpy) { fprintf(stderr, "flightsim: can't open display\n"); return 1; }
+        int scr = DefaultScreen(dpy);
+        root = RootWindow(dpy, scr);
+        int attrs[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
+        XVisualInfo *vi = glXChooseVisual(dpy, scr, attrs);
+        if (!vi) { fprintf(stderr, "flightsim: no suitable GLX visual\n"); return 1; }
 
-    XWindowAttributes ra;
-    XGetWindowAttributes(dpy, root, &ra);
-    XSetWindowAttributes swa = {0};
-    swa.colormap = XCreateColormap(dpy, root, vi->visual, AllocNone);
-    swa.event_mask = StructureNotifyMask | KeyPressMask | ExposureMask;
-    swa.override_redirect = opt_root;
-    if (opt_root) { W = ra.width; H = ra.height; XSelectInput(dpy, root, StructureNotifyMask); }
-    if (offscreen) { W = off_w; H = off_h; }
-    Window win = XCreateWindow(dpy, root, 0, 0, offscreen ? 64 : W, offscreen ? 64 : H, 0, vi->depth, InputOutput, vi->visual,
-                               CWColormap | CWEventMask | CWOverrideRedirect, &swa);
-    XStoreName(dpy, win, "Flight Sim");
-    XClassHint ch = {"flightsim", "Flightsim"};
-    XSetClassHint(dpy, win, &ch);
-    Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wm_delete, 1);
-    if (!offscreen) XMapRaised(dpy, win);
+        XWindowAttributes ra;
+        XGetWindowAttributes(dpy, root, &ra);
+        XSetWindowAttributes swa = {0};
+        swa.colormap = XCreateColormap(dpy, root, vi->visual, AllocNone);
+        swa.event_mask = StructureNotifyMask | KeyPressMask | ExposureMask;
+        swa.override_redirect = opt_root;
+        if (opt_root) { W = ra.width; H = ra.height; XSelectInput(dpy, root, StructureNotifyMask); }
+        if (offscreen) { W = off_w; H = off_h; }
+        win = XCreateWindow(dpy, root, 0, 0, offscreen ? 64 : W, offscreen ? 64 : H, 0, vi->depth, InputOutput, vi->visual,
+                                   CWColormap | CWEventMask | CWOverrideRedirect, &swa);
+        XStoreName(dpy, win, "Flight Sim");
+        XClassHint ch = {"flightsim", "Flightsim"};
+        XSetClassHint(dpy, win, &ch);
+        wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+        XSetWMProtocols(dpy, win, &wm_delete, 1);
+        if (!offscreen) XMapRaised(dpy, win);
 
-    GLXContext ctx = glXCreateContext(dpy, vi, NULL, True);
-    glXMakeCurrent(dpy, win, ctx);
+        GLXContext ctx = glXCreateContext(dpy, vi, NULL, True);
+        glXMakeCurrent(dpy, win, ctx);
+    }
     choose_palette();
     gl_init();
 
@@ -2886,7 +2999,8 @@ int main(int argc, char **argv) {
     render_scale = opt_scale > 0 ? opt_scale : 0.75f;
     double avg = 1.0 / 60, last_change = 0;
     for (int frame = 0;; frame++) {
-        while (XPending(dpy)) {
+        if (opt_layer && !wl_poll()) return 0;
+        while (dpy && XPending(dpy)) {
             XEvent ev;
             XNextEvent(dpy, &ev);
             if (ev.type == ConfigureNotify) {
@@ -2904,7 +3018,8 @@ int main(int argc, char **argv) {
         render(0);
         glFinish();
         double took = now() - t;
-        glXSwapBuffers(dpy, win);
+        if (opt_layer) eglSwapBuffers(wl.ed, wl.es);         /* waits for the compositor's frame */
+        else glXSwapBuffers(dpy, win);
 
         /* dynamic resolution: keep each frame well inside a 60 Hz budget,
          * leaving room for the other instances sharing the GPU */
