@@ -443,6 +443,14 @@ float hash12(vec2 p) {
     p3 += dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
 }
+/* Tiling textures without the tiling showing: each layer is turned by a
+ * different angle whose matrix is integer, (a b; -b a), and scaled by a power
+ * of two, so the world-coordinate wrap (uWorldMod, 16384 m) still lands on
+ * whole tiles. The layer's tile is S / |(a, b)| metres. */
+vec2 turn(vec2 w, vec2 m, float S) { return vec2(m.x * w.x + m.y * w.y, -m.y * w.x + m.x * w.y) / S; }
+/* a slope read in turned texture space, back into world axes */
+vec2 unturn(vec2 g, vec2 m) { return vec2(m.x * g.x - m.y * g.y, m.y * g.x + m.x * g.y) / length(m); }
+
 /* interleaved gradient noise: a jitter that tiles smoothly, unlike white noise */
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float hash13(vec3 p3) {
@@ -776,17 +784,24 @@ void main() {
 static const char *FS_TERRAIN = GLSL(
 in vec3 vRel;
 out vec4 oCol;
+/* Normal from the heightmap by central differences. The mip is picked from
+ * the distance (texel size e metres), not the hardware's screen derivatives:
+ * those jump between mips across tiny triangles and draw bands on the
+ * hills. The step grows with the mip to match. */
+float gDist;
 vec3 hmNormal(sampler2D tex, vec2 uv, float px, float e, out float forest) {
-    vec2 c = texture(tex, uv).rg;
+    float lod = max(log2(gDist * uPixAng * 1.5 / e), 0.0), k = exp2(lod);
+    vec2 c = textureLod(tex, uv, lod).rg;
     forest = c.g;
-    float hl = texture(tex, uv - vec2(px, 0.0)).r, hr = texture(tex, uv + vec2(px, 0.0)).r;
-    float hd = texture(tex, uv - vec2(0.0, px)).r, hu = texture(tex, uv + vec2(0.0, px)).r;
-    return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
+    float hl = textureLod(tex, uv - vec2(px * k, 0.0), lod).r, hr = textureLod(tex, uv + vec2(px * k, 0.0), lod).r;
+    float hd = textureLod(tex, uv - vec2(0.0, px * k), lod).r, hu = textureLod(tex, uv + vec2(0.0, px * k), lod).r;
+    return normalize(vec3(hl - hr, 2.0 * e * k, hd - hu));
 }
-float nz(vec2 w, float s, int ch) { vec4 v = texture(uNoise2, w / s); return ch == 0 ? v.r : ch == 1 ? v.g : ch == 2 ? v.b : v.a; }
+float nz(vec2 w, vec2 m, float S, int ch) { vec4 v = texture(uNoise2, turn(w, m, S)); return ch == 0 ? v.r : ch == 1 ? v.g : ch == 2 ? v.b : v.a; }
 void main() {
     vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
     float dist = length(p - cam);
+    gDist = dist;
     vec3 rd = (p - cam) / dist;
     float cheb = max(abs(p.x), abs(p.z));
     float f1, f0, forest;
@@ -799,7 +814,10 @@ void main() {
         forest = w0 < 1.0 ? mix(f1, f0, w0) : f0;
     } else forest = f1;
     vec2 w = uWorldMod + p.xz;
-    float n1 = nz(w, 1024.0, 0), n2 = nz(w, 256.0, 1), n3 = nz(w, 32.0, 2);
+    /* ~1.6 km, ~315 m and ~30 m, each turned differently */
+    float n1 = nz(w, vec2(3.0, 4.0), 8192.0, 0), n2 = nz(w, vec2(5.0, 12.0), 4096.0, 1);
+    /* the fine one twice, turned apart, so its lattice doesn't read as a grid */
+    float n3 = clamp(0.5 + 1.35 * (0.5 * (nz(w, vec2(8.0, -15.0), 512.0, 2) + nz(w, vec2(12.0, 5.0), 256.0, 2)) - 0.5), 0.0, 1.0);
 
     /* small-scale relief the heightmap can't carry: crisp ridged detail at
      * 128, 32 and 8 m, projected from above and from the side the slope faces
@@ -816,18 +834,21 @@ void main() {
         vec2 sideUV = sx ? ww.zy : ww.xy;
         vec3 dn = vec3(0.0);
         for (int k = 0; k < 3; k++) {
-            float S = k == 0 ? 128.0 : k == 1 ? 32.0 : 8.0, amt = k == 0 ? far : k == 1 ? near : fine;
+            /* ~102, ~39 and ~7.5 m tiles, turned apart so they never line up */
+            vec2 m = k == 0 ? vec2(3.0, 4.0) : k == 1 ? vec2(5.0, 12.0) : vec2(8.0, -15.0);
+            float S = k == 2 ? 128.0 : 512.0, amt = k == 0 ? far : k == 1 ? near : fine;
             if (amt <= 0.0) break;
             /* skip a projection that hardly shows (most ground is flat-ish) */
             /* (the 128 m layer is seen from afar: its dominant one will do) */
             float lo = k == 0 ? 0.5 : 0.03;
-            vec4 t0 = top > lo ? texture(uDetail, ww.xz / S) : vec4(0.5);
-            vec4 t1 = top < 1.0 - lo ? texture(uDetail, sideUV / S) : vec4(0.5);
-            vec2 g0 = t0.rg * 2.0 - 1.0, g1 = t1.rg * 2.0 - 1.0;
+            vec4 t0 = top > lo ? texture(uDetail, turn(ww.xz, m, S)) : vec4(0.5);
+            vec4 t1 = top < 1.0 - lo ? texture(uDetail, turn(sideUV, m, S)) : vec4(0.5);
+            vec2 g0 = unturn(t0.rg * 2.0 - 1.0, m), g1 = unturn(t1.rg * 2.0 - 1.0, m);
             /* a slope in a projection plane tilts the normal against it */
             vec3 d = vec3(g0.x, 0.0, g0.y) * top;
             d += (sx ? vec3(0.0, g1.y, g1.x) : vec3(g1.x, g1.y, 0.0)) * (1.0 - top);
-            float str = (k == 0 ? 0.8 : k == 1 ? 1.1 : 0.55) * amt * mix(0.3, 1.0, rockiness);
+            /* rougher and smoother ground by region, so no two hills match */
+            float str = (k == 0 ? 0.8 : k == 1 ? 1.1 : 0.55) * amt * mix(0.12, 1.0, rockiness) * (0.45 + 1.1 * n2);
             dn += d * str;
             float c = mix(t0.a, t1.a, 1.0 - top);
             if (k == 1) cav = mix(0.5, c, amt); else if (k == 2) cav2 = mix(0.5, c, amt);
@@ -845,7 +866,7 @@ void main() {
     col = mix(col, alpine, smoothstep(700.0, 1000.0, hN));
     col *= (0.85 + 0.3 * n3) * (0.88 + 0.24 * cav2);           /* tufts */
     float fo = smoothstep(0.15, 0.55, forest) * (1.0 - smoothstep(0.35, 0.5, slope));
-    col = mix(col, canopy * (0.65 + 0.7 * nz(w, 14.0, 3)), fo);
+    col = mix(col, canopy * (0.8 + 0.4 * n3), fo);          /* (a finer noise here drew a lattice on wooded hills) */
     col = mix(sand, col, smoothstep(0.5, 3.5, h - 2.0 * n3));
     float strata = 0.9 + 0.1 * sin(h * 0.05 + n2 * 6.0) + 0.25 * (n3 - 0.5);
     /* rock: crevices dark, ridges and ledges light */
@@ -885,12 +906,10 @@ out vec4 oCol;
 uniform sampler2D uSSR;        /* reflections off flat water, quarter res (FS_SSR) */
 uniform vec2 uSceneSize;
 uniform sampler2D uWave;
-/* slope of one scrolling, rotated layer of the wave map, tile s metres */
-vec2 waveSlope(vec2 w, float s, float rot, float speed) {
-    float c = cos(rot), sn = sin(rot);
-    vec2 q = mat2(c, -sn, sn, c) * w;
-    vec2 g = texture(uWave, q / s + vec2(uTime * speed / s, 0.0)).rg * 2.0 - 1.0;
-    return mat2(c, sn, -sn, c) * g;
+/* slope of one scrolling, turned layer of the wave map (see turn()) */
+vec2 waveSlope(vec2 w, vec2 m, float S, float speed) {
+    vec2 g = texture(uWave, turn(w, m, S) + vec2(uTime * speed * length(m) / S, 0.0)).rg * 2.0 - 1.0;
+    return unturn(g, m);
 }
 void main() {
     vec3 p = vRel, cam = vec3(0.0, uCamY, 0.0);
@@ -910,7 +929,8 @@ void main() {
      * smooth the slopes with distance. */
     float gust = smoothstep(0.3, 0.7, texture(uNoise2, (w + vec2(uTime * 4.0, uTime * 1.5)) / 2048.0).g);
     float amp = mix(0.3, 1.0, gust) * mix(0.5, 1.0, smoothstep(0.5, 5.0, depth));
-    vec2 g = waveSlope(w, 64.0, 0.35, 1.6) * 0.22 + waveSlope(w, 16.0, -0.5, 0.8) * 0.12;
+    /* ~51 m and ~20 m tiles */
+    vec2 g = waveSlope(w, vec2(4.0, 3.0), 256.0, 1.6) * 0.22 + waveSlope(w, vec2(12.0, -5.0), 256.0, 0.8) * 0.12;
     vec3 n = normalize(vec3(-g.x * amp, 1.0, -g.y * amp));
     vec3 R = reflect(rd, n);
     R.y = abs(R.y);
