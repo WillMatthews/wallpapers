@@ -480,7 +480,7 @@ vec3 fogColor(vec3 rd) { return skyBase(rd); }
  * height over ~2 km (so it pools in whatever valleys there are, and over the
  * lakes), full density below the top and thinning fast above it. */
 float mistTop(vec2 xz) {
-    return max(textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, 6.0).r - 80.0, 12.0);
+    return max(textureLod(uH1, (uT1Cam + xz / 32.0 + 0.5) / 1024.0, 6.0).r - 80.0, 5.0);
 }
 /* optical depth along rd for t metres: the height above the mist top runs
  * linearly from the camera's to the end's, so it integrates exactly */
@@ -955,6 +955,56 @@ void main() {
     vec3 light = uSunCol * (diff + back * vec3(0.8, 1.3, 0.5)) * vShadow * mix(0.55, 1.0, ao) +
                  mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5) * ao * mix(0.6, 1.0, cl);
     oCol = vec4(atmos(base * light, rd, dist, 6, ign(gl_FragCoord.xy)), 1.0);
+}
+);
+
+/* Birds: a 16-triangle bird whose wings bend at the shoulder and elbow.
+ * aP.w: 0 body, 1 inner wing (shoulder..elbow), 2 outer wing (elbow..tip). */
+static const char *VS_BIRD = GLSL(
+layout(location = 0) in vec4 aP;
+layout(location = 1) in vec4 iA;   /* rel x, y, z, heading (radians, 0 = -z) */
+layout(location = 2) in vec4 iB;   /* flap angle, roll, scale, pitch */
+uniform mat4 uVP;
+out vec3 vRel; out vec3 vN;
+void main() {
+    vec3 p = aP.xyz;
+    float a = iB.x, s = sign(p.x), ax = abs(p.x);
+    vec3 n = vec3(0.0, 1.0, 0.0);
+    if (aP.w > 0.5) {
+        float r1 = min(ax, 0.45) - 0.08, r2 = max(ax - 0.45, 0.0);
+        float a2 = aP.w > 1.5 ? a * 1.5 : a;
+        p.x = s * (0.08 + r1 * cos(a) + r2 * cos(a2));
+        p.y = r1 * sin(a) + r2 * sin(a2);
+        n = vec3(-s * sin(a2), cos(a2), 0.0);
+    }
+    /* roll, pitch, then heading */
+    float cr = cos(iB.y), sr = sin(iB.y), cp = cos(iB.w), sp = sin(iB.w), ch = cos(iA.w), sh = sin(iA.w);
+    p = vec3(p.x * cr - p.y * sr, p.x * sr + p.y * cr, p.z);
+    n = vec3(n.x * cr - n.y * sr, n.x * sr + n.y * cr, n.z);
+    p = vec3(p.x, p.y * cp + p.z * sp, -p.y * sp + p.z * cp);
+    n = vec3(n.x, n.y * cp + n.z * sp, -n.y * sp + n.z * cp);
+    /* bird +z (forward) maps to the heading direction (-sin h, -cos h) */
+    p = vec3(p.x * ch - p.z * sh, p.y, -p.x * sh - p.z * ch);
+    n = vec3(n.x * ch - n.z * sh, n.y, -n.x * sh - n.z * ch);
+    vRel = iA.xyz + p * iB.z;
+    vN = n;
+    gl_Position = uVP * vec4(vRel, 1.0);
+}
+);
+
+static const char *FS_BIRD = GLSL(
+in vec3 vRel; in vec3 vN;
+out vec4 oCol;
+void main() {
+    vec3 cam = vec3(0.0, uCamY, 0.0);
+    float dist = length(vRel - cam);
+    vec3 rd = (vRel - cam) / dist;
+    vec3 n = normalize(vN);
+    if (dot(n, rd) > 0.0) n = -n;                  /* two-sided */
+    vec3 base = vec3(0.05, 0.045, 0.04);
+    float diff = max(dot(n, uSunDir), 0.0);
+    vec3 light = uSunCol * diff * cloudShadow(vRel) + mix(uAmbGnd, uAmbSky, n.y * 0.5 + 0.5);
+    oCol = vec4(atmos(base * light, rd, dist, 4, ign(gl_FragCoord.xy)), 1.0);
 }
 );
 
@@ -1683,6 +1733,109 @@ static void draw_water(void) {
     glDisable(GL_BLEND);
 }
 
+/* ---- birds ----
+ * Flocks live in BCELL-metre world cells (half of them have one), each
+ * circling a spot over the ground. Everything is a closed-form function of
+ * the sim time, so spanned instances agree without simulating anything. */
+#define BCELL 800.0
+#define BIRD_R 2200.0f                       /* beyond this a bird is under a pixel */
+static GLuint p_bird, vao_bird, vbo_bird_inst;
+static int bird_nv, bird_n;
+
+static void birds_init(void) {
+    /* x right, y up, z forward (m, for a ~1.6 m span); w: body/inner/outer */
+    static const float v[][4] = {
+        /* body: nose, shoulders, tail fan */
+        {0, 0, 0.35f, 0}, {-0.08f, 0, 0.05f, 0}, {0.08f, 0, 0.05f, 0},
+        {-0.08f, 0, 0.05f, 0}, {0, 0.02f, -0.3f, 0}, {0.08f, 0, 0.05f, 0},
+        {0, 0.02f, -0.3f, 0}, {-0.12f, 0, -0.42f, 0}, {0.12f, 0, -0.42f, 0},
+        /* left wing: inner quad, outer triangle */
+        {-0.08f, 0, 0.12f, 1}, {-0.45f, 0, 0.08f, 1}, {-0.08f, 0, -0.08f, 1},
+        {-0.08f, 0, -0.08f, 1}, {-0.45f, 0, 0.08f, 1}, {-0.45f, 0, -0.14f, 1},
+        {-0.45f, 0, 0.08f, 2}, {-0.82f, 0, -0.12f, 2}, {-0.45f, 0, -0.14f, 2},
+        /* right wing */
+        {0.08f, 0, 0.12f, 1}, {0.08f, 0, -0.08f, 1}, {0.45f, 0, 0.08f, 1},
+        {0.08f, 0, -0.08f, 1}, {0.45f, 0, -0.14f, 1}, {0.45f, 0, 0.08f, 1},
+        {0.45f, 0, 0.08f, 2}, {0.45f, 0, -0.14f, 2}, {0.82f, 0, -0.12f, 2},
+    };
+    bird_nv = (int)(sizeof v / sizeof v[0]);
+    GLuint vbo;
+    glGenVertexArrays(1, &vao_bird);
+    glBindVertexArray(vao_bird);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, (void *)0);
+    glGenBuffers(1, &vbo_bird_inst);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_bird_inst);
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 32, (void *)0);
+    glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 32, (void *)16);
+    glVertexAttribDivisor(1, 1);
+    glVertexAttribDivisor(2, 1);
+    glBindVertexArray(0);
+}
+
+static void birds_update(void) {
+    enum { MAXB = 1024 };
+    static float inst[MAXB * 8];
+    double t = sim_time;
+    int32_t ci = (int32_t)floor(fl.x / BCELL), cj = (int32_t)floor(fl.z / BCELL);
+    bird_n = 0;
+    for (int dj = -3; dj <= 3; dj++)
+        for (int di = -3; di <= 3; di++) {
+            int32_t gi = ci + di, gj = cj + dj;
+            if (rand01(gi, gj, 900) > 0.5f) continue;
+            /* the flock: circles radius R at speed v round a spot, often drifting off it */
+            double cx = (gi + 0.2 + 0.6 * rand01(gi, gj, 901)) * BCELL, cz = (gj + 0.2 + 0.6 * rand01(gi, gj, 902)) * BCELL;
+            float R = 80 + 220 * rand01(gi, gj, 903), v = 11 + 5 * rand01(gi, gj, 904);
+            float dir = rand01(gi, gj, 905) < 0.5f ? 1.0f : -1.0f, w = dir * v / R;
+            double ph = rand01(gi, gj, 906) * 6.2832 + w * t;
+            double fx = cx + R * cos(ph) + 300 * sin(t * 0.013 + gi), fz = cz + R * sin(ph) + 300 * cos(t * 0.011 + gj);
+            if ((fx - fl.x) * (fx - fl.x) + (fz - fl.z) * (fz - fl.z) > (BIRD_R + 150.0) * (BIRD_R + 150.0)) continue;
+            /* velocity of the flock centre */
+            double vx = -R * w * sin(ph) + 300 * 0.013 * cos(t * 0.013 + gi), vz = R * w * cos(ph) - 300 * 0.011 * sin(t * 0.011 + gj);
+            /* ground here and a little ahead, from the fine map (it spans the bird range) */
+            float g0, g1, fo;
+            hm0_sample(fx, fz, &g0, &fo);
+            hm0_sample(fx + vx * 6, fz + vz * 6, &g1, &fo);
+            float gy = fmaxf(fmaxf(g0, g1), 0);
+            float fy = gy + 60 + 90 * rand01(gi, gj, 907);
+            int nb = 8 + (int)(28 * rand01(gi, gj, 908));
+            float spread = 10 + 3.0f * sqrtf((float)nb);
+            float roll = -dir * atanf(v * v / (R * 9.8f));
+            for (int b = 0; b < nb && bird_n < MAXB; b++) {
+                /* each bird wanders round its place in the flock */
+                float p1 = rand01(b, gi * 7 + gj, 910) * 6.28f, p2 = rand01(b, gi * 7 + gj, 911) * 6.28f, p3 = rand01(b, gi * 7 + gj, 912) * 6.28f;
+                float f1 = 0.15f + 0.1f * rand01(b, gj, 913), f2 = 0.11f + 0.1f * rand01(b, gi, 914);
+                float ox = spread * sinf((float)(t * f1) + p1), oz = spread * sinf((float)(t * f2) + p2);
+                float oy = spread * 0.3f * sinf((float)(t * (f1 + f2) * 0.5) + p3);
+                double bvx = vx + spread * f1 * cos(t * f1 + p1), bvz = vz + spread * f2 * cos(t * f2 + p2);
+                float bvy = spread * 0.3f * (f1 + f2) * 0.5f * cosf((float)(t * (f1 + f2) * 0.5) + p3);
+                double bx = fx + ox, bz = fz + oz;
+                float *o = inst + 8 * bird_n++;
+                o[0] = (float)(bx - fl.x); o[1] = fy + oy; o[2] = (float)(bz - fl.z);
+                o[3] = (float)atan2(-bvx, -bvz);
+                /* flap in bursts, glide in between (wings slightly up) */
+                float ft = (float)t + p3 * 3;
+                float glide = smoothstep(0.2f, 0.6f, sinf(ft * 0.45f + p1));
+                o[4] = (1 - glide) * 0.75f * sinf(ft * 17.0f) + glide * 0.12f;
+                o[5] = roll + 0.15f * sinf(ft * 0.7f);
+                o[6] = 1.4f + 0.5f * rand01(b, gi + gj, 915);             /* big birds: they have to read on screen */
+                o[7] = atanf(bvy / (float)sqrt(bvx * bvx + bvz * bvz));
+            }
+        }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_bird_inst);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 8 * (bird_n ? bird_n : 1), NULL, GL_STREAM_DRAW);
+    if (bird_n) glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * 8 * bird_n, inst);
+}
+
+static void draw_birds(void) {
+    if (!bird_n) return;
+    set_common(p_bird);
+    glBindVertexArray(vao_bird);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, bird_nv, bird_n);
+}
+
 static void fullscreen(void) {
     glBindVertexArray(vao_empty);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1892,6 +2045,7 @@ static void render(GLuint target) {
     hm_update(&hm[0], fl.x, fl.z);
     hm_update(&hm[1], fl.x, fl.z);
     if (opt_trees) trees_update();
+    birds_update();
     prof_mark(PR_BAKE);
     bake_step();
 
@@ -1914,6 +2068,7 @@ static void render(GLuint target) {
     /* trees first: the terrain's costly shading then skips what they hide */
     prof_mark(PR_TREE);
     if (opt_trees) draw_trees();
+    draw_birds();
     prof_mark(PR_TERR);
     draw_terrain();
 
@@ -1953,6 +2108,8 @@ static void gl_init(void) {
     patch_init();
     p_water = program("water", VS_WATER, FS_WATER);
     p_tree = program_full("tree", VS_TREE, NULL, NULL, FS_TREE, "const bool kDither = true;\n");
+    p_bird = program("bird", VS_BIRD, FS_BIRD);
+    birds_init();
     p_tree_solid = program_full("tree", VS_TREE, NULL, NULL, FS_TREE, "layout(early_fragment_tests) in;\nconst bool kDither = false;\n");
     p_bake = program("bake", VS_FULL, FS_BAKE);
     p_down = program("down", VS_FULL, FS_DOWN);
