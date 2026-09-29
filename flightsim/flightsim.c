@@ -164,6 +164,7 @@ static struct {
     float sun_dir[3], sun[3], zen[3], hor[3], hor_sun[3], amb_sky[3], amb_gnd[3];
     float fog_a, fog_b, haze, cover, cbase, cthick, cdens, exposure, glow, stars, disc, sat;
     float mist;                      /* valley mist density, 1/m */
+    float shafts;                    /* light shaft strength */
 } pal;
 
 static float lin(float c) { return powf(c, 2.2f); }
@@ -190,7 +191,9 @@ static void choose_palette(void) {
     pal.cover = p->cover; pal.cbase = p->cbase; pal.cthick = p->cthick; pal.cdens = p->cdens;
     pal.exposure = p->exposure; pal.glow = p->glow; pal.stars = p->stars; pal.disc = p->disc; pal.sat = p->sat;
     /* valley mist: thick with the sun low, lingering at night, wisps by day */
-    pal.mist = p->stars > 0.5f ? 0.0012f : 0.0004f + 0.0014f * (1 - smoothstep(4, 25, p->el));
+    pal.mist = p->stars > 0.5f ? 0.0009f : 0.0003f + 0.0008f * (1 - smoothstep(4, 25, p->el));
+    /* light shafts: strongest with the sun low, faint by moonlight */
+    pal.shafts = p->stars > 0.5f ? 0.15f : 0.35f + 0.65f * (1 - smoothstep(5, 30, p->el));
 }
 
 /* ---- flight model (an autopilot, really) ---- */
@@ -401,6 +404,8 @@ static GLuint program_full(const char *name, const char *vs, const char *tcs, co
     GLint l = glGetUniformLocation(p, "uHist");                 /* unit 7 is the upload scratch unit */
     if (l < 0) l = glGetUniformLocation(p, "uCloudTex");
     if (l >= 0) glUniform1i(l, 8);
+    if ((l = glGetUniformLocation(p, "uDepth")) >= 0) glUniform1i(l, 9);
+    if ((l = glGetUniformLocation(p, "uShaft")) >= 0) glUniform1i(l, 10);
     return p;
 }
 
@@ -497,7 +502,9 @@ float mistDepth(vec3 rd, float t) {
     /* patchy, drifting slowly */
     vec2 w = uWorldMod + e.xz + vec2(uTime * 1.5, uTime * 0.6);
     float patchy = texture(uNoise2, w / 4000.0).g * 0.75 + texture(uNoise2, w / 1200.0).b * 0.25;
-    return uMist * t * od * smoothstep(0.2, 0.8, patchy) * 1.6;
+    /* none right round the camera: it's for looking down or across on, not
+     * for flying blind through */
+    return uMist * t * od * smoothstep(0.2, 0.8, patchy) * 1.6 * smoothstep(100.0, 600.0, t);
 }
 /* mist is whiter than the haze, lit a little by the sun */
 vec3 mistColor(vec3 rd) {
@@ -506,7 +513,7 @@ vec3 mistColor(vec3 rd) {
     return mix(f, vec3(l * 1.05), 0.45) + uSunCol * max(uSunDir.y, 0.0) * 0.02;
 }
 vec3 applyMist(vec3 col, vec3 rd, float t, float alpha) {
-    float T = exp(-mistDepth(rd, t));
+    float T = max(exp(-mistDepth(rd, t)), 0.25);      /* never a whiteout */
     return col * T + mistColor(rd) * (1.0 - T) * alpha;
 }
 
@@ -530,7 +537,9 @@ float cloudShadow(vec3 p) {
     /* soft-edged, like the penumbra of a thick cloud: a steep slope maps a few
      * metres of height onto a long run of the cloud field (up to 1/sin of the
      * sun's elevation), so any fine detail here comes out as stripes */
-    return 1.0 - 0.75 * smoothstep(0.03, 0.45, cloudCovLod(q, 400.0));
+    float sy = max(uSunDir.y, 0.06);
+    float fp = 400.0 * max(1.0, 0.25 / sy);          /* the blur grows with that squash */
+    return 1.0 - 0.75 * mix(0.4, 1.0, smoothstep(0.05, 0.25, sy)) * smoothstep(0.03, 0.45, cloudCovLod(q, fp));
 }
 float hg(float mu, float g) { return (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5); }
 
@@ -1081,7 +1090,7 @@ void main() {
 
 static const char *FS_POST = GLSL(
 in vec2 vUV;
-uniform sampler2D uSrc; uniform sampler2D uBloom;
+uniform sampler2D uSrc; uniform sampler2D uBloom; uniform sampler2D uShaft; uniform float uShaftAmt;
 uniform vec2 uTexel; uniform float uExposure; uniform float uBloomAmt; uniform float uSharpen; uniform float uSat;
 uniform vec4 uVig;   /* this view in layout-normalised coords: x0, y0, w, h */
 out vec4 oCol;
@@ -1095,6 +1104,7 @@ void main() {
         c = max(c + (c - blur) * 1.6 * uSharpen, vec3(0.0));
     }
     c += texture(uBloom, vUV).rgb * uBloomAmt;
+    if (uShaftAmt > 0.0) c += texture(uShaft, vUV).rgb * uShaftAmt;
     c = aces(c * uExposure);
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
     c = max(mix(vec3(l), c, uSat), 0.0);
@@ -1106,13 +1116,55 @@ void main() {
 }
 );
 
+/* Light shafts. The mask: sky seen near the sun, dimmed by cloud in front
+ * of it (depth 0 is the far plane: nothing drawn there). */
+static const char *FS_SHAFT_MASK = GLSL(
+in vec2 vUV;
+uniform vec4 uViewTan; uniform mat3 uCamRot;
+uniform sampler2D uDepth; uniform sampler2D uCloudTex;
+out vec4 oCol;
+void main() {
+    vec3 rd = normalize(uCamRot * vec3(uViewTan.x + vUV.x * uViewTan.z, uViewTan.y + vUV.y * uViewTan.w, -1.0));
+    vec4 d = textureGather(uDepth, vUV);
+    float sky = dot(vec4(equal(d, vec4(0.0))), vec4(0.25));
+    float T = uCloudsOn > 0.5 ? texture(uCloudTex, vUV).a : 1.0;
+    float mu = max(dot(rd, uSunDir), 0.0);
+    oCol = vec4(uSunCol * sky * T * (pow(mu, 40.0) * 0.5 + pow(mu, 400.0) * 1.5), 1.0);
+}
+);
+
+/* ...smeared out from the sun, fading with distance along each ray */
+static const char *FS_SHAFT_BLUR = GLSL(
+in vec2 vUV;
+uniform sampler2D uShaft; uniform vec2 uSunUV; uniform float uAspect;
+out vec4 oCol;
+void main() {
+    const int N = 40;
+    vec2 d = uSunUV - vUV;
+    /* reach at most ~0.7 of the screen toward the sun */
+    float len = length(d * vec2(uAspect, 1.0));
+    d *= min(1.0, 0.7 / max(len, 1e-4)) / float(N);
+    vec2 p = vUV + d * ign(gl_FragCoord.xy);
+    vec3 sum = vec3(0.0);
+    float w = 1.0;
+    for (int i = 0; i < N; i++) {
+        sum += texture(uShaft, p).rgb * w;
+        w *= 0.955;
+        p += d;
+    }
+    oCol = vec4(sum / float(N), 1.0);
+}
+);
+
 /* ---- GL state ---- */
-static GLuint p_sky, p_cloud, p_tree_solid, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
+static GLuint p_shaft_mask, p_shaft_blur, p_sky, p_cloud, p_tree_solid, p_terr, p_water, p_tree, p_bake, p_down, p_up, p_post;
 static GLuint vao_empty, vao_water, tex_shadow, fbo_bake, tex_noise2, tex_noise3;
 #define FOG_FAR 14000.0f
 
 /* offscreen targets */
-static GLuint fbo_scene, tex_scene, rb_depth, fbo_final, tex_final;
+static GLuint fbo_scene, tex_scene, tex_depth, fbo_final, tex_final;
+static GLuint fbo_shaft[2], tex_shaft[2];     /* light shafts at quarter res: the mask, then its radial blur */
+static int shaft_w, shaft_h;
 static GLuint fbo_cloud[2], tex_cloud[2];     /* sky clouds at half res, this frame's and last's (ping-pong) */
 static int cloud_w, cloud_h;
 static int cloud_cur, cloud_hist;             /* cloud_hist: tex_cloud[!cloud_cur] is valid */
@@ -1144,7 +1196,8 @@ static void resize_scene(int w, int h) {
     if (w == scene_w && h == scene_h) return;
     scene_w = w; scene_h = h;
     if (tex_scene) {
-        glDeleteTextures(1, &tex_scene); glDeleteRenderbuffers(1, &rb_depth); glDeleteFramebuffers(1, &fbo_scene);
+        glDeleteTextures(1, &tex_scene); glDeleteTextures(1, &tex_depth); glDeleteFramebuffers(1, &fbo_scene);
+        glDeleteTextures(2, tex_shaft); glDeleteFramebuffers(2, fbo_shaft);
         glDeleteTextures(NBLOOM, tex_bloom); glDeleteFramebuffers(NBLOOM, fbo_bloom);
         glDeleteTextures(2, tex_cloud); glDeleteFramebuffers(2, fbo_cloud);
     }
@@ -1155,11 +1208,15 @@ static void resize_scene(int w, int h) {
     }
     cloud_hist = 0;
     tex_scene = mk_tex2d(GL_R11F_G11F_B10F, w, h, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);   /* HDR; alpha unused */
-    glGenRenderbuffers(1, &rb_depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, rb_depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, w, h);
+    /* depth as a texture: the light shafts read where the sky shows through */
+    tex_depth = mk_tex2d(GL_DEPTH_COMPONENT32F, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
     fbo_scene = mk_fbo(tex_scene);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb_depth);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, tex_depth, 0);
+    shaft_w = (w + 3) / 4; shaft_h = (h + 3) / 4;
+    for (int i = 0; i < 2; i++) {
+        tex_shaft[i] = mk_tex2d(GL_R11F_G11F_B10F, shaft_w, shaft_h, GL_RGB, GL_FLOAT, NULL, GL_LINEAR, GL_CLAMP_TO_EDGE);
+        fbo_shaft[i] = mk_fbo(tex_shaft[i]);
+    }
     for (int i = 0; i < NBLOOM; i++) {
         bloom_w[i] = w >> (i + 1); bloom_h[i] = h >> (i + 1);
         if (bloom_w[i] < 1) bloom_w[i] = 1;
@@ -1841,8 +1898,41 @@ static void fullscreen(void) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+/* returns the strength to composite at (0: sun off screen / behind) */
+static float draw_shafts(void) {
+    /* the sun on screen: into view space (camera looks down -z), then view uv */
+    float v[3];
+    for (int r = 0; r < 3; r++) v[r] = rot3[r * 3 + 0] * pal.sun_dir[0] + rot3[r * 3 + 1] * pal.sun_dir[1] + rot3[r * 3 + 2] * pal.sun_dir[2];
+    if (v[2] > -0.05f) return 0;
+    float u = (v[0] / -v[2] - view_tan[0]) / view_tan[2], w = (v[1] / -v[2] - view_tan[1]) / view_tan[3];
+    float out = fmaxf(fmaxf(-u, u - 1), fmaxf(-w, w - 1));
+    float amt = pal.shafts * (1 - smoothstep(0.1f, 0.8f, out)) * smoothstep(-0.05f, -0.25f, v[2]);
+    if (amt <= 0) return 0;
+    glViewport(0, 0, shaft_w, shaft_h);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_shaft[0]);
+    set_common(p_shaft_mask);
+    glUniform4fv(UL(p_shaft_mask, "uViewTan"), 1, view_tan);
+    glUniformMatrix3fv(UL(p_shaft_mask, "uCamRot"), 1, GL_FALSE, rot3);
+    glActiveTexture(GL_TEXTURE9);
+    glBindTexture(GL_TEXTURE_2D, tex_depth);
+    glActiveTexture(GL_TEXTURE8);
+    glBindTexture(GL_TEXTURE_2D, tex_cloud[cloud_cur]);
+    fullscreen();
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_shaft[1]);
+    set_common(p_shaft_blur);
+    glUniform2f(UL(p_shaft_blur, "uSunUV"), u, w);
+    glUniform1f(UL(p_shaft_blur, "uAspect"), (float)shaft_w / shaft_h);
+    glActiveTexture(GL_TEXTURE10);
+    glBindTexture(GL_TEXTURE_2D, tex_shaft[0]);
+    fullscreen();
+    glBindTexture(GL_TEXTURE_2D, tex_shaft[1]);        /* for the composite */
+    glActiveTexture(GL_TEXTURE7);
+    return amt;
+}
+
 static void post(GLuint target) {
     glDisable(GL_DEPTH_TEST);
+    float shaft_amt = draw_shafts();
     /* bloom: soft-threshold downsample chain, then tent upsample back */
     glUseProgram(p_down);
     glActiveTexture(GL_TEXTURE5);
@@ -1878,6 +1968,7 @@ static void post(GLuint target) {
     glUniform2f(UL(p_post, "uTexel"), 1.0f / scene_w, 1.0f / scene_h);
     glUniform1f(UL(p_post, "uExposure"), pal.exposure);
     glUniform1f(UL(p_post, "uBloomAmt"), 0.06f);
+    glUniform1f(UL(p_post, "uShaftAmt"), shaft_amt);
     glUniform1f(UL(p_post, "uSat"), pal.sat);
     glUniform1f(UL(p_post, "uSharpen"), scene_w < W ? 0.5f : 0.0f);
     glUniform4f(UL(p_post, "uVig"), (view_x - lay_x0) / lay_w, (lay_y0 + lay_h - view_y - view_h) / lay_h, view_w / lay_w, view_h / lay_h);
@@ -2104,6 +2195,8 @@ static void gl_init(void) {
     GLSL_COMMON = COMMON_SRC;
     p_sky = program("sky", VS_FULL, FS_SKY);
     p_cloud = program("cloud", VS_FULL, FS_CLOUD);
+    p_shaft_mask = program("shaft mask", VS_FULL, FS_SHAFT_MASK);
+    p_shaft_blur = program("shaft blur", VS_FULL, FS_SHAFT_BLUR);
     p_terr = program_tess("terrain", VS_TERRAIN, TCS_TERRAIN, TES_TERRAIN, FS_TERRAIN);
     patch_init();
     p_water = program("water", VS_WATER, FS_WATER);
