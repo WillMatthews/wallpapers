@@ -209,6 +209,8 @@ static struct {
     double x, z;
     float y, yaw, pitch, roll, vy;
     float speed, turn, turn_target, clearance, next_change;
+    float plan_turn, vy_avoid;       /* from the last avoidance plan */
+    int replan;                      /* steps until the next one */
 } fl;
 static uint32_t rng_state;
 static float frand(void) {
@@ -223,6 +225,54 @@ static void pick_route(float t) {
     fl.next_change = t + 4 + frand() * 8;
 }
 
+#define MAX_TURN 0.32f               /* rad/s */
+#define NARC 17                      /* candidate turns, -MAX_TURN..MAX_TURN */
+#define AVOID_CLEAR 70.0f            /* m, over the highest point on the way */
+#define AVOID_LO 0.15f               /* fraction of full climb: start pulling up... */
+#define AVOID_HI 0.5f                /* ...and climb flat out by here */
+
+/* The climb rate that clears every point along an arc of constant turn, by
+ * the time we get there (less a moment for the climb to build). The
+ * ridges have needle peaks a kilometre tall, so it looks ~20 s ahead, and
+ * the arc is a tube widening with distance, so none slips between arcs. */
+static float arc_climb(float turn) {
+    float vy = -1e9f;
+    for (float d = 20; d <= 3000; d += d < 600 ? 20 : 40) {
+        float a = fl.yaw + turn * d / fl.speed;
+        double x = fl.x - sinf(a) * d, z = fl.z - cosf(a) * d;
+        float w = 20 + d * 0.06f, sx = cosf(a) * w, sz = -sinf(a) * w;
+        float h = fmaxf(terrain(x, z), fmaxf(terrain(x + sx, z + sz), terrain(x - sx, z - sz)));
+        vy = fmaxf(vy, (fmaxf(h, 0) + AVOID_CLEAR - fl.y) / fmaxf(d / fl.speed - 0.5f, 0.25f));
+    }
+    return vy;
+}
+
+/* Ten times a second: of a fan of arcs, pick the one nearest where we'd
+ * like to turn that doesn't need a hard climb, and the climb that keeps us
+ * clear while we bank over to it. The peak that gets hit is one just off
+ * the arc we predicted, so we commit to flying the arc we checked, and count
+ * every arc swept through on the way (and one beyond: the turn overshoots). */
+static void plan_avoid(float pref) {
+    float need[NARC], sweep[NARC], best = 1e9f;
+    float step = 2 * MAX_TURN / (NARC - 1);
+    for (int k = 0; k < NARC; k++) need[k] = arc_climb(MAX_TURN * (2.0f * k / (NARC - 1) - 1));
+    int cur = (int)lroundf((fl.turn + MAX_TURN) / step);
+    for (int k = 0; k < NARC; k++) {
+        int lo = (k < cur ? k : cur) - 1, hi = (k > cur ? k : cur) + 1;
+        sweep[k] = -1e9f;
+        for (int j = lo < 0 ? 0 : lo; j <= hi && j < NARC; j++) sweep[k] = fmaxf(sweep[k], need[j]);
+    }
+    for (int k = 0; k < NARC; k++) {
+        float c = MAX_TURN * (2.0f * k / (NARC - 1) - 1);
+        /* 10 m/s of climb is worth 0.1 rad/s of turn; sticky, so it doesn't
+         * flit. Judged mostly on where it ends up: when every way on means
+         * a climb, the way to go is toward the lowest. */
+        float there = fmaxf(need[k], fmaxf(need[k > 0 ? k - 1 : k], need[k < NARC - 1 ? k + 1 : k]));
+        float cost = (fmaxf(there, 0) + fmaxf(sweep[k], 0) * 0.3f) * 0.01f + fabsf(c - pref) + fabsf(c - fl.plan_turn);
+        if (cost < best) { best = cost; fl.plan_turn = c; fl.vy_avoid = sweep[k]; }
+    }
+}
+
 static void fly(float dt, float t) {
     if (t > fl.next_change) pick_route(t);
 
@@ -232,8 +282,8 @@ static void fly(float dt, float t) {
     double rx = fl.x - sinf(fl.yaw - 0.6f) * look, rz = fl.z - cosf(fl.yaw - 0.6f) * look;
     float bias = (ground(rx, rz) - ground(lx, lz)) * 0.0006f;
     if (bias > 0.3f) bias = 0.3f; else if (bias < -0.3f) bias = -0.3f;
-    float want = fl.turn_target + bias;
-    if (want > 0.32f) want = 0.32f; else if (want < -0.32f) want = -0.32f;
+    if (fl.replan-- <= 0) { fl.replan = 11; plan_avoid(fl.turn_target + bias); }
+    float want = fl.plan_turn;
     fl.turn += (want - fl.turn) * (1 - expf(-dt * 0.8f));
     fl.yaw += fl.turn * dt;
 
@@ -252,9 +302,14 @@ static void fly(float dt, float t) {
     need = fmaxf(fminf(need, pal.cbase - 120), safe);
     float floor_h = ground(fl.x, fl.z) + 35;
     if (need < floor_h) need = floor_h;
+    /* climb hard (up to ~35 degrees) for something tall, but leave it late:
+     * nothing until it needs AVOID_LO of full climb, all of it by AVOID_HI */
+    float vy_max = fl.speed * 0.7f;
     float vy_target = (need - fl.y) * 0.5f;
-    if (vy_target > 55) vy_target = 55; else if (vy_target < -30) vy_target = -30;
-    fl.vy += (vy_target - fl.vy) * (1 - expf(-dt * 1.5f));
+    if (fl.vy_avoid > AVOID_LO * vy_max)
+        vy_target = fmaxf(vy_target, vy_max * smoothstep(AVOID_LO, AVOID_HI, fl.vy_avoid / vy_max));
+    if (vy_target > vy_max) vy_target = vy_max; else if (vy_target < -45) vy_target = -45;
+    fl.vy += (vy_target - fl.vy) * (1 - expf(-dt * (vy_target > fl.vy ? 3.0f : 1.5f)));
     fl.y += fl.vy * dt;
     if (fl.y < floor_h) fl.y = floor_h;
     float pitch_target = atan2f(fl.vy, fl.speed);
@@ -262,6 +317,18 @@ static void fly(float dt, float t) {
 
     fl.x -= sin(fl.yaw) * fl.speed * dt;
     fl.z -= cos(fl.yaw) * fl.speed * dt;
+}
+
+/* Start high enough that nothing ahead needs more than a gentle climb. */
+static void spawn(void) {
+    fl.y = ground(0, 0) + 150;
+    fl.plan_turn = fl.turn_target;
+    float need = 1e9f;
+    while (need > fl.speed * 0.7f * AVOID_LO) {
+        need = -1e9f;
+        for (int k = 0; k < NARC; k++) need = fmaxf(need, arc_climb(MAX_TURN * (2.0f * k / (NARC - 1) - 1)));
+        if (need > fl.speed * 0.7f * AVOID_LO) fl.y += 25;
+    }
 }
 
 /* ---- threads ---- */
@@ -2960,8 +3027,8 @@ int main(int argc, char **argv) {
 
     fl.speed = 150 * opt_speed;
     fl.yaw = frand() * 2 * (float)M_PI;
-    fl.y = ground(0, 0) + 150;
     pick_route(0);
+    spawn();
 
     if (offscreen) {
         tex_final = mk_tex2d(GL_RGBA8, W, H, GL_RGBA, GL_UNSIGNED_BYTE, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
